@@ -1,0 +1,50 @@
+# .pylintrc - Pylint configuration for DOCX Diff
+
+[MASTER]
+# Use multiple processes for faster checking
+jobs=0
+
+# Python version
+py-version=3.6
+
+# Ignore patterns
+ignore=CVS,.git,__pycache__,.venv,venv
+
+[MESSAGES CONTROL]
+# Disable specific warnings that are not critical for this project
+disable=
+    C0103,  # Invalid name (we use descriptive names)
+    C0114,  # Missing module docstring (not needed for all modules)
+    R0913,  # Too many arguments (some functions need many params)
+    R0914,  # Too many local variables (acceptable in main functions)
+    W0703,  # Catching too general exception (we handle appropriately)
+    C0301,  # Line too long (handled by Black)
+    
+[FORMAT]
+# Maximum line length
+max-line-length=100
+
+# Allow the body of an if to be on the same line
+single-line-if-stmt=yes
+
+[DESIGN]
+# Maximum number of arguments for function / method
+max-args=10
+
+# Maximum number of attributes for a class
+max-attributes=15
+
+# Maximum number of locals for function / method body
+max-locals=25
+
+[SIMILARITIES]
+# Minimum lines number of a similarity
+min-similarity-lines=6
+
+[TYPECHECK]
+# List of members which are not checked
+ignored-classes=tkinter
+
+[LOGGING]
+# Format style used to check logging format string
+logging-format-style=new

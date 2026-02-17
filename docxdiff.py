@@ -1,55 +1,174 @@
 #!/usr/bin/env python3
+"""DOCX Diff - Compare DOCX files and display differences.
+
+A production-ready tool for comparing Microsoft Word DOCX files with support
+for multiple output formats including unified diff, side-by-side, HTML, and JSON.
+Supports both CLI and GUI modes.
+
+Author: Hayk Jomardyan
+License: MIT
+"""
 import argparse
 import difflib
+import json
+import logging
+import os
 import sys
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import List, Tuple, Optional, Dict, Any
+
+# Version information
+__version__ = "1.0.0"
+__author__ = "Hayk Jomardyan"
+__license__ = "MIT"
 
 # Windows DPI awareness for crisp display on high-DPI screens
 try:
     from ctypes import windll
     # Set DPI awareness for Windows 8.1 and later
     windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
-except:
+except Exception:
     try:
         # Fallback for Windows Vista and later
         windll.user32.SetProcessDPIAware()
-    except:
+    except Exception:
         pass  # Not on Windows or DPI awareness not available
 
-from docx import Document
+try:
+    from docx import Document
+except ImportError:
+    print("Error: python-docx is not installed. Install it with: pip install python-docx", 
+          file=sys.stderr)
+    sys.exit(2)
+
+# Configuration constants
+class Config:
+    """Application configuration constants."""
+    DEFAULT_CONTEXT_LINES = 3
+    MAX_CONTEXT_LINES = 100
+    MIN_CONTEXT_LINES = 0
+    DEFAULT_FONT_SIZE = 10
+    MIN_FONT_SIZE = 6
+    MAX_FONT_SIZE = 24
+    GUI_WINDOW_SIZE = "1600x900"
+    SUPPORTED_EXTENSIONS = ('.docx',)
+    MAX_FILE_SIZE_MB = 100  # Maximum file size in MB
+    ENCODING = 'utf-8'
+
+# ANSI color codes for terminal output
+class Colors:
+    """ANSI color codes for terminal output."""
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    CYAN = '\033[96m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+# Configure logging
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger('docxdiff')
+
+
+def validate_file(path: Path) -> Tuple[bool, str]:
+    """Validate file exists, is readable, and has correct extension.
+    
+    Args:
+        path: Path to the file to validate
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not path.exists():
+        return False, f"File not found: {path}"
+    
+    if not path.is_file():
+        return False, f"Not a file: {path}"
+    
+    if path.suffix.lower() not in Config.SUPPORTED_EXTENSIONS:
+        return False, f"Unsupported file type: {path.suffix}. Expected: {', '.join(Config.SUPPORTED_EXTENSIONS)}"
+    
+    # Check file size
+    file_size_mb = path.stat().st_size / (1024 * 1024)
+    if file_size_mb > Config.MAX_FILE_SIZE_MB:
+        return False, f"File too large: {file_size_mb:.1f}MB (max: {Config.MAX_FILE_SIZE_MB}MB)"
+    
+    # Check if file is readable
+    if not os.access(path, os.R_OK):
+        return False, f"File not readable: {path}"
+    
+    return True, ""
 
 
 def iter_block_text(doc: Document):
-    """
-    Yield logical text blocks in reading order.
+    """Yield logical text blocks in reading order.
+    
     Includes paragraphs and table cells, flattened as text lines.
+    Uses a pragmatic approach since python-docx doesn't expose unified block iteration.
+    
+    Args:
+        doc: Document object from python-docx
+        
+    Yields:
+        str: Text blocks prefixed with P| for paragraphs or T{table}R{row}C{col}| for cells
     """
-    # Paragraphs first in document order.
-    # python-docx does not expose a single unified block iterator for paragraphs and tables
-    # in true visual order without using the underlying XML. This is a pragmatic approach.
-    for p in doc.paragraphs:
-        text = (p.text or "").strip()
-        yield f"P|{text}"
+    try:
+        # Paragraphs first in document order
+        for p in doc.paragraphs:
+            text = (p.text or "").strip()
+            yield f"P|{text}"
 
-    # Tables after paragraphs. This may differ from visual order if tables appear mid document.
-    # Still useful for most simple comparison workflows.
-    for ti, table in enumerate(doc.tables, start=1):
-        for ri, row in enumerate(table.rows, start=1):
-            for ci, cell in enumerate(row.cells, start=1):
-                cell_text = " ".join((cell.text or "").split())
-                yield f"T{ti}R{ri}C{ci}|{cell_text}"
+        # Tables after paragraphs
+        for ti, table in enumerate(doc.tables, start=1):
+            for ri, row in enumerate(table.rows, start=1):
+                for ci, cell in enumerate(row.cells, start=1):
+                    cell_text = " ".join((cell.text or "").split())
+                    yield f"T{ti}R{ri}C{ci}|{cell_text}"
+    except Exception as e:
+        logger.error(f"Error extracting text blocks: {e}")
+        raise
 
 
-def load_docx_lines(path: Path):
-    doc = Document(str(path))
-    lines = list(iter_block_text(doc))
-
-    # Optional cleanup to drop empty blocks.
-    lines = [ln for ln in lines if ln.split("|", 1)[1].strip() != ""]
-    return lines
+def load_docx_lines(path: Path) -> List[str]:
+    """Load and extract text lines from a DOCX file.
+    
+    Args:
+        path: Path to the DOCX file
+        
+    Returns:
+        List of text lines from the document
+        
+    Raises:
+        ValueError: If file validation fails
+        RuntimeError: If document loading fails
+    """
+    # Validate file
+    is_valid, error_msg = validate_file(path)
+    if not is_valid:
+        raise ValueError(error_msg)
+    
+    try:
+        logger.debug(f"Loading document: {path}")
+        doc = Document(str(path))
+        lines = list(iter_block_text(doc))
+        
+        # Filter out empty blocks
+        lines = [ln for ln in lines if ln.split("|", 1)[1].strip() != ""]
+        
+        logger.debug(f"Extracted {len(lines)} lines from {path.name}")
+        return lines
+        
+    except Exception as e:
+        error_msg = f"Failed to load document {path.name}: {str(e)}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from e
 
 
 def print_unified_diff(a_lines, b_lines, a_name, b_name, context_lines=3):
@@ -68,65 +187,524 @@ def print_unified_diff(a_lines, b_lines, a_name, b_name, context_lines=3):
     return any_output
 
 
+def print_colored_diff(a_lines: List[str], b_lines: List[str], 
+                       a_name: str, b_name: str, context_lines: int = 3) -> bool:
+    """Print diff with ANSI color codes for terminal output.
+    
+    Args:
+        a_lines: Lines from first file
+        b_lines: Lines from second file
+        a_name: Name/path of first file
+        b_name: Name/path of second file
+        context_lines: Number of context lines around differences
+        
+    Returns:
+        True if differences were found, False otherwise
+    """
+    try:
+        diff = difflib.unified_diff(
+            a_lines,
+            b_lines,
+            fromfile=a_name,
+            tofile=b_name,
+            lineterm="",
+            n=context_lines,
+        )
+        
+        any_output = False
+        for line in diff:
+            any_output = True
+            if line.startswith('---') or line.startswith('+++'):
+                print(f"{Colors.BOLD}{Colors.CYAN}{line}{Colors.RESET}")
+            elif line.startswith('@@'):
+                print(f"{Colors.YELLOW}{line}{Colors.RESET}")
+            elif line.startswith('-'):
+                print(f"{Colors.RED}{line}{Colors.RESET}")
+            elif line.startswith('+'):
+                print(f"{Colors.GREEN}{line}{Colors.RESET}")
+            else:
+                print(line)
+        
+        return any_output
+    except Exception as e:
+        logger.error(f"Error printing colored diff: {e}")
+        # Fallback to non-colored output
+        return print_unified_diff(a_lines, b_lines, a_name, b_name, context_lines)
+
+
+def calculate_diff_stats(a_lines: List[str], b_lines: List[str]) -> dict:
+    """Calculate statistics about the differences between two files."""
+    differ = difflib.Differ()
+    diff = list(differ.compare(a_lines, b_lines))
+    
+    stats = {
+        "additions": sum(1 for line in diff if line.startswith('+ ')),
+        "deletions": sum(1 for line in diff if line.startswith('- ')),
+        "unchanged": sum(1 for line in diff if line.startswith('  ')),
+        "total_lines_a": len(a_lines),
+        "total_lines_b": len(b_lines),
+    }
+    
+    # Calculate similarity ratio
+    matcher = difflib.SequenceMatcher(None, a_lines, b_lines)
+    stats["similarity"] = round(matcher.ratio() * 100, 2)
+    
+    return stats
+
+
+def export_to_html(a_lines: List[str], b_lines: List[str], 
+                   a_name: str, b_name: str, output_path: str, 
+                   context_lines: int = 3) -> bool:
+    """Export diff to HTML file with syntax highlighting.
+    
+    Args:
+        a_lines: Lines from first file
+        b_lines: Lines from second file
+        a_name: Name/path of first file
+        b_name: Name/path of second file
+        output_path: Path where HTML file will be saved
+        context_lines: Number of context lines around differences
+        
+    Returns:
+        True if export was successful
+        
+    Raises:
+        IOError: If file cannot be written
+    """
+    try:
+        logger.debug(f"Exporting HTML to: {output_path}")
+        differ = difflib.HtmlDiff(wrapcolumn=80)
+        
+        html_content = differ.make_file(
+            a_lines,
+            b_lines,
+            fromdesc=a_name,
+            todesc=b_name,
+            context=True,
+            numlines=context_lines
+        )
+        
+        # Add custom styling and metadata
+        custom_style = f"""
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; }}
+            .diff {{ border: 1px solid #ddd; border-radius: 4px; }}
+            .diff_header {{ background-color: #e0e0e0; padding: 10px; font-weight: bold; }}
+            td.diff_header {{ text-align: right; color: #666; }}
+            .diff_next {{ background-color: #c0c0c0; }}
+            .diff_add {{ background-color: #d4edda; }}
+            .diff_chg {{ background-color: #fff3cd; }}
+            .diff_sub {{ background-color: #f8d7da; }}
+            .footer {{ margin-top: 20px; padding: 10px; background: #f5f5f5; 
+                      border-radius: 4px; font-size: 0.9em; color: #666; }}
+        </style>
+        <div class="footer">
+            Generated by DOCX Diff v{__version__} on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        </div>
+        """
+        
+        html_content = html_content.replace('</head>', f'{custom_style}</head>')
+        
+        output_file = Path(output_path)
+        output_file.write_text(html_content, encoding=Config.ENCODING)
+        logger.info(f"HTML export successful: {output_path}")
+        return True
+        
+    except IOError as e:
+        error_msg = f"Failed to write HTML file: {str(e)}"
+        logger.error(error_msg)
+        raise IOError(error_msg) from e
+    except Exception as e:
+        error_msg = f"Unexpected error during HTML export: {str(e)}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from e
+
+
+def export_to_json(a_lines: List[str], b_lines: List[str], 
+                   a_name: str, b_name: str, output_path: str, 
+                   context_lines: int = 3) -> bool:
+    """Export diff to JSON format with metadata and statistics.
+    
+    Args:
+        a_lines: Lines from first file
+        b_lines: Lines from second file
+        a_name: Name/path of first file
+        b_name: Name/path of second file
+        output_path: Path where JSON file will be saved
+        context_lines: Number of context lines around differences
+        
+    Returns:
+        True if export was successful
+        
+    Raises:
+        IOError: If file cannot be written
+        json.JSONDecodeError: If JSON encoding fails
+    """
+    try:
+        logger.debug(f"Exporting JSON to: {output_path}")
+        differ = difflib.Differ()
+        diff = list(differ.compare(a_lines, b_lines))
+        
+        changes = []
+        for i, line in enumerate(diff):
+            change_type = None
+            content = line[2:] if len(line) > 2 else ""
+            
+            if line.startswith('+ '):
+                change_type = "addition"
+            elif line.startswith('- '):
+                change_type = "deletion"
+            elif line.startswith('? '):
+                continue  # Skip hint lines
+            elif line.startswith('  '):
+                change_type = "unchanged"
+            
+            if change_type:
+                changes.append({
+                    "line_number": i + 1,
+                    "type": change_type,
+                    "content": content
+                })
+        
+        stats = calculate_diff_stats(a_lines, b_lines)
+        
+        output = {
+            "metadata": {
+                "version": __version__,
+                "file_a": a_name,
+                "file_b": b_name,
+                "timestamp": datetime.now().isoformat(),
+                "context_lines": context_lines
+            },
+            "statistics": stats,
+            "changes": changes
+        }
+        
+        output_file = Path(output_path)
+        output_file.write_text(
+            json.dumps(output, indent=2, ensure_ascii=False), 
+            encoding=Config.ENCODING
+        )
+        logger.info(f"JSON export successful: {output_path}")
+        return True
+        
+    except (IOError, json.JSONDecodeError) as e:
+        error_msg = f"Failed to export JSON: {str(e)}"
+        logger.error(error_msg)
+        raise IOError(error_msg) from e
+    except Exception as e:
+        error_msg = f"Unexpected error during JSON export: {str(e)}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from e
+
+
+def print_side_by_side(a_lines, b_lines, a_name, b_name, width=80):
+    """Print side-by-side comparison."""
+    col_width = width // 2 - 3
+    
+    print("=" * width)
+    print(f"{a_name:<{col_width}} | {b_name:<{col_width}}")
+    print("=" * width)
+    
+    max_lines = max(len(a_lines), len(b_lines))
+    differ = difflib.Differ()
+    diff_result = list(differ.compare(a_lines, b_lines))
+    
+    a_idx = b_idx = 0
+    for line in diff_result:
+        if line.startswith('  '):  # Unchanged
+            content = line[2:]
+            left = content[:col_width]
+            right = content[:col_width]
+            print(f"{left:<{col_width}} | {right:<{col_width}}")
+            a_idx += 1
+            b_idx += 1
+        elif line.startswith('- '):  # Deleted
+            content = line[2:]
+            left = content[:col_width]
+            print(f"{left:<{col_width}} | {'':>{col_width}}")
+            a_idx += 1
+        elif line.startswith('+ '):  # Added
+            content = line[2:]
+            right = content[:col_width]
+            print(f"{'':>{col_width}} | {right:<{col_width}}")
+            b_idx += 1
+        elif line.startswith('? '):  # Hint line
+            continue
+    
+    print("=" * width)
+
+
+def print_statistics(stats: dict, verbose: bool = False):
+    """Print statistics about the diff."""
+    print("\n" + "=" * 60)
+    print("DIFF STATISTICS")
+    print("=" * 60)
+    print(f"Similarity:        {stats['similarity']}%")
+    print(f"Lines Added:       {stats['additions']}")
+    print(f"Lines Deleted:     {stats['deletions']}")
+    print(f"Lines Unchanged:   {stats['unchanged']}")
+    print(f"Total Lines (A):   {stats['total_lines_a']}")
+    print(f"Total Lines (B):   {stats['total_lines_b']}")
+    
+    if verbose:
+        total_changes = stats['additions'] + stats['deletions']
+        if total_changes > 0:
+            add_percent = round((stats['additions'] / total_changes) * 100, 2)
+            del_percent = round((stats['deletions'] / total_changes) * 100, 2)
+            print(f"\nChange Breakdown:")
+            print(f"  Additions:       {add_percent}%")
+            print(f"  Deletions:       {del_percent}%")
+    
+    print("=" * 60)
+
+
 def main():
+    """Main entry point for CLI mode.
+    
+    Returns:
+        int: Exit code (0=no differences, 1=differences found, 2=error)
+    """
     parser = argparse.ArgumentParser(
-        description="Compare two DOCX files and print text differences."
+        description=f"DOCX Diff v{__version__} - Compare DOCX files and display differences.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s file1.docx file2.docx
+  %(prog)s file1.docx file2.docx --color --stats
+  %(prog)s file1.docx file2.docx --html output.html
+  %(prog)s file1.docx file2.docx --json output.json
+  %(prog)s file1.docx file2.docx --side-by-side
+
+For more information, visit: https://github.com/yourusername/docx-diff
+        """
     )
+    
+    # Version argument
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'%(prog)s {__version__}'
+    )
+    
+    # Positional arguments
     parser.add_argument("file_a", help="First DOCX file path")
     parser.add_argument("file_b", help="Second DOCX file path")
-    parser.add_argument(
-        "--context",
+    
+    # Comparison options
+    compare_group = parser.add_argument_group('Comparison Options')
+    compare_group.add_argument(
+        "--context", "-c",
         type=int,
-        default=3,
-        help="Number of context lines to show around differences",
+        default=Config.DEFAULT_CONTEXT_LINES,
+        metavar="N",
+        help=f"Number of context lines (default: {Config.DEFAULT_CONTEXT_LINES}, max: {Config.MAX_CONTEXT_LINES})",
     )
-    parser.add_argument(
-        "--ignore-case",
+    compare_group.add_argument(
+        "--ignore-case", "-i",
         action="store_true",
-        help="Compare case insensitively",
+        help="Compare case-insensitively",
     )
-    parser.add_argument(
-        "--ignore-whitespace",
+    compare_group.add_argument(
+        "--ignore-whitespace", "-w",
         action="store_true",
         help="Normalize whitespace before comparing",
     )
+    
+    # Output format options
+    output_group = parser.add_argument_group('Output Format Options')
+    output_group.add_argument(
+        "--color",
+        action="store_true",
+        help="Display colorized output in terminal",
+    )
+    output_group.add_argument(
+        "--side-by-side", "-y",
+        action="store_true",
+        help="Display differences side by side",
+    )
+    output_group.add_argument(
+        "--stats", "-s",
+        action="store_true",
+        help="Show statistics summary",
+    )
+    output_group.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress normal output, only show if files differ (exit code)",
+    )
+    output_group.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Show detailed statistics and information",
+    )
+    
+    # Export options
+    export_group = parser.add_argument_group('Export Options')
+    export_group.add_argument(
+        "--html",
+        metavar="FILE",
+        help="Export diff to HTML file",
+    )
+    export_group.add_argument(
+        "--json",
+        metavar="FILE",
+        help="Export diff to JSON file",
+    )
+    export_group.add_argument(
+        "--output", "-o",
+        metavar="FILE",
+        help="Write output to file instead of stdout",
+    )
+    
     args = parser.parse_args()
 
-    path_a = Path(args.file_a)
-    path_b = Path(args.file_b)
+    # Enable verbose logging if requested
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    elif args.quiet:
+        logger.setLevel(logging.ERROR)
 
-    if not path_a.exists() or not path_b.exists():
-        print("Error. One or both input files do not exist.", file=sys.stderr)
+    # Validate context lines
+    if not Config.MIN_CONTEXT_LINES <= args.context <= Config.MAX_CONTEXT_LINES:
+        print(f"Error: Context lines must be between {Config.MIN_CONTEXT_LINES} and {Config.MAX_CONTEXT_LINES}",
+              file=sys.stderr)
         return 2
 
-    if path_a.suffix.lower() != ".docx" or path_b.suffix.lower() != ".docx":
-        print("Error. This script supports DOCX files only.", file=sys.stderr)
+    # Validate and load files
+    try:
+        path_a = Path(args.file_a).resolve()
+        path_b = Path(args.file_b).resolve()
+    except Exception as e:
+        print(f"Error: Invalid file path: {e}", file=sys.stderr)
         return 2
 
-    a_lines = load_docx_lines(path_a)
-    b_lines = load_docx_lines(path_b)
+    # Check if comparing the same file
+    if path_a == path_b:
+        print("Error: Both files point to the same location", file=sys.stderr)
+        return 2
 
+    # Load and process files with error handling
+    try:
+        if args.verbose:
+            print(f"Loading {path_a}...", file=sys.stderr)
+        
+        a_lines = load_docx_lines(path_a)
+        
+        if args.verbose:
+            print(f"Loading {path_b}...", file=sys.stderr)
+        
+        b_lines = load_docx_lines(path_b)
+        
+    except (ValueError, RuntimeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"Unexpected error loading files: {e}", file=sys.stderr)
+        logger.exception("Unexpected error in file loading")
+        return 2
+
+    # Apply transformations
     if args.ignore_whitespace:
+        if args.verbose:
+            print("Normalizing whitespace...", file=sys.stderr)
         a_lines = [" ".join(x.split()) for x in a_lines]
         b_lines = [" ".join(x.split()) for x in b_lines]
 
     if args.ignore_case:
+        if args.verbose:
+            print("Converting to lowercase...", file=sys.stderr)
         a_lines = [x.lower() for x in a_lines]
         b_lines = [x.lower() for x in b_lines]
 
-    any_diff = print_unified_diff(
-        a_lines,
-        b_lines,
-        a_name=str(path_a),
-        b_name=str(path_b),
-        context_lines=args.context,
-    )
+    # Calculate statistics if needed
+    stats = None
+    if args.stats or args.verbose or args.json:
+        stats = calculate_diff_stats(a_lines, b_lines)
 
-    if not any_diff:
-        print("No differences found.")
-        return 0
+    # Export to HTML if requested
+    if args.html:
+        try:
+            if args.verbose:
+                print(f"Exporting to HTML: {args.html}...", file=sys.stderr)
+            export_to_html(a_lines, b_lines, str(path_a), str(path_b), args.html, args.context)
+            print(f"HTML export saved to: {args.html}")
+        except (IOError, RuntimeError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
 
-    return 1
+    # Export to JSON if requested
+    if args.json:
+        try:
+            if args.verbose:
+                print(f"Exporting to JSON: {args.json}...", file=sys.stderr)
+            export_to_json(a_lines, b_lines, str(path_a), str(path_b), args.json, args.context)
+            print(f"JSON export saved to: {args.json}")
+        except (IOError, RuntimeError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+
+    # If only exporting, we might skip normal output
+    if args.quiet:
+        # Just return exit code based on differences
+        matcher = difflib.SequenceMatcher(None, a_lines, b_lines)
+        return 0 if matcher.ratio() == 1.0 else 1
+
+    # Redirect output if needed
+    original_stdout = sys.stdout
+    output_file = None
+    if args.output:
+        try:
+            output_file = open(args.output, 'w', encoding=Config.ENCODING)
+            sys.stdout = output_file
+        except IOError as e:
+            print(f"Error: Cannot write to output file: {e}", file=sys.stderr)
+            return 2
+
+    try:
+        # Display diff based on options
+        any_diff = False
+        
+        if args.side_by_side:
+            print_side_by_side(a_lines, b_lines, str(path_a), str(path_b))
+            any_diff = True
+        elif args.color:
+            any_diff = print_colored_diff(
+                a_lines,
+                b_lines,
+                a_name=str(path_a),
+                b_name=str(path_b),
+                context_lines=args.context,
+            )
+        else:
+            any_diff = print_unified_diff(
+                a_lines,
+                b_lines,
+                a_name=str(path_a),
+                b_name=str(path_b),
+                context_lines=args.context,
+            )
+
+        if not any_diff:
+            print("No differences found.")
+        
+        # Show statistics if requested
+        if args.stats and stats:
+            print_statistics(stats, verbose=args.verbose)
+        
+    except Exception as e:
+        print(f"Error during diff generation: {e}", file=sys.stderr)
+        logger.exception("Unexpected error during diff generation")
+        return 2
+    finally:
+        # Restore stdout
+        if output_file:
+            output_file.close()
+            sys.stdout = original_stdout
+            print(f"Output saved to: {args.output}")
+
+    logger.debug(f"Comparison complete. Differences found: {any_diff}")
+    return 1 if any_diff else 0
 
 
 class DocxDiffGUI:
@@ -963,28 +1541,78 @@ class DocxDiffGUI:
 
 
 def launch_gui():
-    root = tk.Tk()
+    """Launch the GUI application.
     
-    # Configure for Windows 11 - use native theme if available
+    Handles GUI initialization with proper error handling for missing dependencies
+    and system configuration issues.
+    """
     try:
-        root.tk.call('tk', 'scaling', root.winfo_fpixels('1i') / 72.0)
-    except:
-        pass
-    
-    # Enable visual styles
-    try:
-        root.tk.call('source', 'azure.tcl')
-        root.tk.call('set_theme', 'light')
-    except:
-        pass  # Azure theme not available, use default
-    
-    app = DocxDiffGUI(root)
-    root.mainloop()
+        root = tk.Tk()
+        root.title(f"DOCX Diff v{__version__}")
+        
+        # Configure for high DPI displays
+        try:
+            root.tk.call('tk', 'scaling', root.winfo_fpixels('1i') / 72.0)
+        except Exception:
+            pass
+        
+        # Enable visual styles if available
+        try:
+            root.tk.call('source', 'azure.tcl')
+            root.tk.call('set_theme', 'light')
+        except Exception:
+            pass  # Azure theme not available, use default
+        
+        # Set window icon if available
+        try:
+            # Try to load icon if it exists
+            icon_path = Path(__file__).parent / 'icon.ico'
+            if icon_path.exists():
+                root.iconbitmap(str(icon_path))
+        except Exception:
+            pass
+        
+        # Initialize GUI
+        app = DocxDiffGUI(root)
+        
+        # Center window on screen
+        root.update_idletasks()
+        width = root.winfo_width()
+        height = root.winfo_height()
+        x = (root.winfo_screenwidth() // 2) - (width // 2)
+        y = (root.winfo_screenheight() // 2) - (height // 2)
+        root.geometry(f'{width}x{height}+{x}+{y}')
+        
+        logger.info("GUI launched successfully")
+        root.mainloop()
+        
+    except ImportError as e:
+        error_msg = f"GUI dependencies missing: {e}\nPlease ensure tkinter is installed."
+        logger.error(error_msg)
+        print(error_msg, file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        error_msg = f"Failed to launch GUI: {e}"
+        logger.exception(error_msg)
+        print(error_msg, file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
-    # If no arguments provided, launch GUI; otherwise use CLI
-    if len(sys.argv) == 1:
-        launch_gui()
-    else:
-        raise SystemExit(main())
+    try:
+        # If no arguments provided, launch GUI; otherwise use CLI
+        if len(sys.argv) == 1:
+            logger.info("Starting GUI mode")
+            launch_gui()
+        else:
+            logger.info("Starting CLI mode")
+            exit_code = main()
+            raise SystemExit(exit_code)
+    except KeyboardInterrupt:
+        logger.info("Operation cancelled by user")
+        print("\nOperation cancelled.", file=sys.stderr)
+        sys.exit(130)  # Standard exit code for SIGINT
+    except Exception as e:
+        logger.exception("Unexpected error in main")
+        print(f"\nUnexpected error: {e}", file=sys.stderr)
+        sys.exit(2)

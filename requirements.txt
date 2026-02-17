@@ -1,0 +1,8 @@
+# Core dependencies for DOCX Diff
+# Production-ready with pinned versions for stability
+
+# DOCX file processing
+python-docx>=0.8.11,<1.0.0
+
+# Optional: For enhanced terminal colors on Windows
+colorama>=0.4.4,<1.0.0; sys_platform == 'win32'
