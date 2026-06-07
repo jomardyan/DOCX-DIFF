@@ -730,6 +730,7 @@ For more information, visit: https://github.com/yourusername/docx-diff
     return 1 if any_diff else 0
 
 
+# pylint: disable=too-many-public-methods
 class DocxDiffGUI:
     def __init__(self, root):
         self.root = root
@@ -748,6 +749,14 @@ class DocxDiffGUI:
             background=[("pressed", "#d4edda"), ("active", "#e8f5e9")],
         )
 
+        # Load recently used files history
+        try:
+            self.history_file = Path.home() / ".docxdiff_history.json"
+        except Exception:
+            self.history_file = Path(".docxdiff_history.json")
+        self.history: List[str] = []
+        self.load_history()
+
         # Statistics tracking
         self.stats = {"additions": 0, "deletions": 0, "changes": 0, "similarity": 0.0}
         self.current_diff_lines = []
@@ -759,9 +768,10 @@ class DocxDiffGUI:
         # File A
         ttk.Label(file_frame, text="A:").grid(row=0, column=0, sticky="w", pady=2, padx=(5, 2))
         self.file_a_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.file_a_var, width=80).grid(
-            row=0, column=1, padx=2, sticky="ew"
+        self.file_a_combo = ttk.Combobox(
+            file_frame, textvariable=self.file_a_var, values=self.history, width=80
         )
+        self.file_a_combo.grid(row=0, column=1, padx=2, sticky="ew")
         ttk.Button(file_frame, text="Browse", command=lambda: self.browse_file("a"), width=8).grid(
             row=0, column=2, padx=2
         )
@@ -769,11 +779,17 @@ class DocxDiffGUI:
         # File B
         ttk.Label(file_frame, text="B:").grid(row=1, column=0, sticky="w", pady=2, padx=(5, 2))
         self.file_b_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.file_b_var, width=80).grid(
-            row=1, column=1, padx=2, sticky="ew"
+        self.file_b_combo = ttk.Combobox(
+            file_frame, textvariable=self.file_b_var, values=self.history, width=80
         )
+        self.file_b_combo.grid(row=1, column=1, padx=2, sticky="ew")
         ttk.Button(file_frame, text="Browse", command=lambda: self.browse_file("b"), width=8).grid(
             row=1, column=2, padx=2
+        )
+
+        # Swap Button
+        ttk.Button(file_frame, text="⇅", command=self.swap_files, width=3).grid(
+            row=0, column=3, rowspan=2, padx=5, pady=2, sticky="ns"
         )
 
         # Make entry fields expand
@@ -844,6 +860,9 @@ class DocxDiffGUI:
             side="left", padx=2
         )
         ttk.Button(button_frame, text="Export HTML", command=self.export_html, width=10).pack(
+            side="left", padx=2
+        )
+        ttk.Button(button_frame, text="Export JSON", command=self.export_json, width=11).pack(
             side="left", padx=2
         )
         ttk.Button(button_frame, text="Search", command=self.show_search_dialog, width=7).pack(
@@ -1097,6 +1116,7 @@ class DocxDiffGUI:
                 self.file_a_var.set(filename)
             else:
                 self.file_b_var.set(filename)
+            self.add_to_history(filename)
 
     def create_context_menu(self, text_widget):
         """Create right-click context menu."""
@@ -1264,6 +1284,9 @@ class DocxDiffGUI:
             # Load and process files
             a_lines = load_docx_lines(path_a)
             b_lines = load_docx_lines(path_b)
+
+            self.add_to_history(str(path_a))
+            self.add_to_history(str(path_b))
 
             self.status_bar.config(text="Processing comparison...")
             self.root.update_idletasks()
@@ -1589,10 +1612,7 @@ class DocxDiffGUI:
                     f.write("<meta charset='utf-8'>\n")
                     f.write("<title>DOCX Comparison Report</title>\n")
                     f.write("<style>\n")
-                    f.write(
-                        "body { font-family: 'Courier New', monospace; "
-                        "margin: 20px; }\n"
-                    )
+                    f.write("body { font-family: 'Courier New', monospace; margin: 20px; }\n")
                     f.write(".header { color: blue; font-weight: bold; }\n")
                     f.write(".added { background-color: #e6ffe6; color: green; }\n")
                     f.write(".removed { background-color: #ffe6e6; color: red; }\n")
@@ -1638,6 +1658,109 @@ class DocxDiffGUI:
                 self.status_bar.config(text=f"Exported to {Path(filename).name}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to export:\n{str(e)}")
+
+    def export_json(self):
+        """Export comparison results to a JSON file."""
+        if not self.current_diff_lines:
+            messagebox.showwarning("Warning", "No comparison results to export.")
+            return
+
+        file_a = self.file_a_var.get()
+        file_b = self.file_b_var.get()
+
+        if not file_a or not file_b:
+            messagebox.showerror("Error", "Missing file information for export.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            title="Export to JSON File",
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
+        )
+
+        if filename:
+            try:
+                # Load lines to call export_to_json function
+                a_lines = load_docx_lines(Path(file_a))
+                b_lines = load_docx_lines(Path(file_b))
+
+                if self.ignore_whitespace_var.get():
+                    a_lines = [" ".join(x.split()) for x in a_lines]
+                    b_lines = [" ".join(x.split()) for x in b_lines]
+
+                if self.ignore_case_var.get():
+                    a_lines = [x.lower() for x in a_lines]
+                    b_lines = [x.lower() for x in b_lines]
+
+                export_to_json(
+                    a_lines,
+                    b_lines,
+                    file_a,
+                    file_b,
+                    filename,
+                    self.context_var.get(),
+                )
+
+                messagebox.showinfo("Success", f"Results exported to {filename}")
+                self.status_bar.config(text=f"Exported to {Path(filename).name}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to export:\n{str(e)}")
+
+    def swap_files(self):
+        """Swap File A and File B paths."""
+        a = self.file_a_var.get()
+        b = self.file_b_var.get()
+        self.file_a_var.set(b)
+        self.file_b_var.set(a)
+        self.status_bar.config(text="Swapped File A and File B")
+
+    def load_history(self):
+        """Load recently used files history."""
+        self.history = []
+        try:
+            if self.history_file.exists():
+                with open(self.history_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        # Filter out empty strings and non-string values to prevent corruption
+                        self.history = [item for item in data if isinstance(item, str) and item]
+        except Exception as e:
+            logger.warning(f"Failed to load history: {e}")
+
+    def save_history(self):
+        """Save recently used files history."""
+        try:
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(self.history, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to save history: {e}")
+
+    def add_to_history(self, file_path):
+        """Add a file path to history."""
+        if not file_path:
+            return
+        try:
+            norm_path = str(Path(file_path).resolve())
+        except (OSError, ValueError):
+            norm_path = file_path
+
+        if norm_path in self.history:
+            self.history.remove(norm_path)
+        self.history.insert(0, norm_path)
+        self.history = self.history[:10]
+
+        self.save_history()
+        self.update_history_comboboxes()
+
+    def update_history_comboboxes(self):
+        """Update values of File A and File B comboboxes.
+
+        Uses hasattr checks because load_history/history initialization
+        occurs before the combobox widgets are constructed in __init__.
+        """
+        if hasattr(self, "file_a_combo") and hasattr(self, "file_b_combo"):
+            self.file_a_combo["values"] = self.history
+            self.file_b_combo["values"] = self.history
 
     def show_search_dialog(self):
         """Show search dialog."""
