@@ -35,3 +35,14 @@ jobs:
         # Exit-zero treats all errors as warnings
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
       continue-on-error: true
+
+    - name: Install Tkinter on Linux
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-tk
+
+    - name: Run tests with pytest
+      run: |
+        pip install pytest pytest-cov
+        python -m pytest tests/ -v --cov=docxdiff --cov-report=term
