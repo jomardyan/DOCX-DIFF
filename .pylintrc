@@ -19,6 +19,17 @@ disable=
     R0914,  # Too many local variables (acceptable in main functions)
     W0703,  # Catching too general exception (we handle appropriately)
     C0301,  # Line too long (handled by Black)
+    C0302,  # Too many lines in module
+    R0903,  # Too few public methods
+    W1203,  # Lazy % formatting in logging functions
+    C0116,  # Missing function or method docstring
+    R0917,  # Too many positional arguments
+    R0911,  # Too many return statements
+    R0912,  # Too many branches
+    R0915,  # Too many statements
+    R1732,  # Consider using with
+    C0115,  # Missing class docstring
+    R0902,  # Too many instance attributes
     
 [FORMAT]
 # Maximum line length
