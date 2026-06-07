@@ -18,7 +18,7 @@ if requirements_file.exists():
 
 setup(
     name="docxdiff",
-    version="1.0.0",
+    version="2.0.0",
     author="DOCX Diff Team",
     author_email="your.email@example.com",
     description="Compare DOCX files and display differences with multiple output formats",
@@ -30,8 +30,8 @@ setup(
         "Documentation": "https://github.com/yourusername/docx-diff#readme",
         "Source Code": "https://github.com/yourusername/docx-diff",
     },
-    py_modules=["docxdiff"],
-    python_requires=">=3.6",
+    py_modules=["docxdiff", "docxdiff_engine", "docxdiff_reports"],
+    python_requires=">=3.8",
     install_requires=requirements,
     extras_require={
         "dev": [
@@ -59,8 +59,6 @@ setup(
         "Topic :: Utilities",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",

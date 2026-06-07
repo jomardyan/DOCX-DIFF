@@ -1,15 +1,25 @@
 import sys
 import json
+import queue
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch, mock_open
 import pytest
 import difflib
 import tkinter as tk
+from docx import Document
 
 # Import functions to test from docxdiff
 from docxdiff import (
     Config,
+    atomic_write_text,
+    build_source_metadata,
+    evaluate_policy,
+    sha256_file,
     validate_file,
+    validate_output_targets,
+    verify_source_metadata,
     iter_block_text,
     load_docx_lines,
     print_unified_diff,
@@ -22,6 +32,71 @@ from docxdiff import (
     main,
     DocxDiffGUI,
 )
+from docxdiff_engine import (
+    ComparisonCancelled,
+    DocumentBlock,
+    compare_blocks,
+    compare_documents,
+    compare_word_spans,
+    extract_document_blocks,
+)
+
+
+def test_sha256_and_source_metadata(tmp_path):
+    source = tmp_path / "contract.docx"
+    source.write_bytes(b"enterprise-document")
+
+    assert sha256_file(source) == (
+        "3d276a64386730d33952a9df78e96c01ce79b108ad4b1f5d8aad80fddbd78cb6"
+    )
+
+    metadata = build_source_metadata(source, redact_path=True)
+    assert metadata["path"] == "contract.docx"
+    assert metadata["size_bytes"] == len(b"enterprise-document")
+    assert metadata["sha256"] == sha256_file(source)
+
+
+def test_verify_source_metadata_detects_changes(tmp_path):
+    source = tmp_path / "contract.docx"
+    source.write_bytes(b"version-one")
+    metadata = build_source_metadata(source)
+    source.write_bytes(b"version-two")
+
+    with pytest.raises(RuntimeError, match="changed during comparison"):
+        verify_source_metadata(source, metadata)
+
+
+def test_atomic_write_text_replaces_existing_file(tmp_path):
+    output = tmp_path / "report.json"
+    output.write_text("old", encoding="utf-8")
+
+    atomic_write_text(output, "new report")
+
+    assert output.read_text(encoding="utf-8") == "new report"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_validate_output_targets_rejects_collisions(tmp_path):
+    source = tmp_path / "source.docx"
+    report = tmp_path / "report.json"
+
+    valid, message = validate_output_targets([source], [source])
+    assert not valid
+    assert "overwrite an input" in message
+
+    valid, message = validate_output_targets([report, report], [source])
+    assert not valid
+    assert "same path" in message
+
+
+def test_evaluate_policy():
+    stats = {"similarity": 75.0, "additions": 3, "deletions": 2}
+
+    violations = evaluate_policy(stats, min_similarity=80.0, max_changes=4)
+
+    assert len(violations) == 2
+    assert "below required" in violations[0]
+    assert "exceeds allowed" in violations[1]
 
 
 def test_validate_file_not_found(tmp_path):
@@ -126,6 +201,124 @@ def test_load_docx_lines_runtime_error(mock_document_class, tmp_path):
         load_docx_lines(valid_file)
 
 
+def test_structured_extraction_preserves_order_and_sections(tmp_path):
+    path = tmp_path / "structured.docx"
+    document = Document()
+    document.add_paragraph("Before table")
+    table = document.add_table(rows=1, cols=1)
+    table.cell(0, 0).paragraphs[0].text = "Outer cell"
+    nested = table.cell(0, 0).add_table(rows=1, cols=1)
+    nested.cell(0, 0).text = "Nested cell"
+    document.add_paragraph("After table")
+    document.sections[0].header.paragraphs[0].text = "Header text"
+    document.sections[0].footer.paragraphs[0].text = "Footer text"
+    document.save(path)
+
+    blocks = extract_document_blocks(path)
+
+    assert [block.text for block in blocks] == [
+        "Before table",
+        "Outer cell",
+        "Nested cell",
+        "After table",
+        "Header text",
+        "Footer text",
+    ]
+    assert [block.kind for block in blocks] == [
+        "paragraph",
+        "table_cell",
+        "table_cell",
+        "paragraph",
+        "header",
+        "footer",
+    ]
+    assert blocks[2].location["table_path"] == [1, 1]
+
+
+def test_structured_extraction_classifies_headings_and_lists(tmp_path):
+    path = tmp_path / "styles.docx"
+    document = Document()
+    document.add_heading("Executive Summary", level=1)
+    document.add_paragraph("First item", style="List Bullet")
+    document.save(path)
+
+    blocks = extract_document_blocks(path)
+
+    assert blocks[0].kind == "heading"
+    assert blocks[0].style == "Heading 1"
+    assert blocks[1].kind == "list_item"
+    assert blocks[1].list_level == 0
+
+
+def test_word_spans_handle_punctuation_unicode_and_normalization():
+    old_spans, new_spans = compare_word_spans(
+        "Hello, Wörld!  Value 10.",
+        "Hello, wörld! Value 20.",
+        ignore_case=True,
+        ignore_whitespace=True,
+    )
+
+    assert [span.text for span in old_spans] == ["10"]
+    assert [span.text for span in new_spans] == ["20"]
+
+
+def test_compare_blocks_preserves_original_text_when_ignored():
+    old = DocumentBlock(
+        "a",
+        "paragraph",
+        "Important   TERMS",
+        {"scope": "body", "paragraph": 1},
+        normalized_text="important terms",
+    )
+    new = DocumentBlock(
+        "b",
+        "paragraph",
+        "important terms",
+        {"scope": "body", "paragraph": 1},
+        normalized_text="important terms",
+    )
+
+    result = compare_blocks([old], [new], ignore_case=True, ignore_whitespace=True)
+
+    assert result.differences_found is False
+    assert result.changes[0].old_block.text == "Important   TERMS"
+    assert result.changes[0].new_block.text == "important terms"
+
+
+def test_compare_blocks_detects_moved_block():
+    blocks_a = [
+        DocumentBlock("a1", "paragraph", "Alpha", {"paragraph": 1}, normalized_text="Alpha"),
+        DocumentBlock("a2", "paragraph", "Beta", {"paragraph": 2}, normalized_text="Beta"),
+        DocumentBlock("a3", "paragraph", "Gamma", {"paragraph": 3}, normalized_text="Gamma"),
+    ]
+    blocks_b = [
+        DocumentBlock("b1", "paragraph", "Beta", {"paragraph": 1}, normalized_text="Beta"),
+        DocumentBlock("b2", "paragraph", "Alpha", {"paragraph": 2}, normalized_text="Alpha"),
+        DocumentBlock("b3", "paragraph", "Gamma", {"paragraph": 3}, normalized_text="Gamma"),
+    ]
+
+    result = compare_blocks(blocks_a, blocks_b)
+
+    moved = [change for change in result.changes if change.change_type == "moved"]
+    assert len(moved) == 1
+    assert moved[0].old_block.text == "Beta"
+    assert moved[0].new_block.text == "Beta"
+    assert moved[0].moved_from == {"paragraph": 2}
+    assert moved[0].moved_to == {"paragraph": 1}
+
+
+def test_compare_documents_can_be_cancelled(tmp_path):
+    path = tmp_path / "cancel.docx"
+    document = Document()
+    document.add_paragraph("Text")
+    document.save(path)
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(ComparisonCancelled):
+        compare_documents(path, path, cancel_event=cancel_event)
+
+
 def test_print_unified_diff(capsys):
     a_lines = ["line 1", "line 2"]
     b_lines = ["line 1", "line 2 changed"]
@@ -181,6 +374,16 @@ def test_export_to_html(tmp_path):
     assert "b.docx" in content
 
 
+def test_export_to_html_escapes_descriptions(tmp_path):
+    out_html = tmp_path / "diff.html"
+
+    export_to_html(["a"], ["b"], "<script>alert(1)</script>", "b.docx", str(out_html))
+
+    content = out_html.read_text(encoding="utf-8")
+    assert "<script>alert(1)</script>" not in content
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in content
+
+
 def test_export_to_json(tmp_path):
     a_lines = ["line 1"]
     b_lines = ["line 2"]
@@ -195,6 +398,70 @@ def test_export_to_json(tmp_path):
     assert "statistics" in data
     assert "changes" in data
     assert data["statistics"]["similarity"] == 0.0
+
+
+def test_export_to_json_includes_provenance(tmp_path):
+    out_json = tmp_path / "diff.json"
+    sources = {
+        "file_a": {"path": "a.docx", "size_bytes": 1, "sha256": "a" * 64},
+        "file_b": {"path": "b.docx", "size_bytes": 1, "sha256": "b" * 64},
+    }
+
+    export_to_json(
+        ["line 1"],
+        ["line 2"],
+        "a.docx",
+        "b.docx",
+        str(out_json),
+        source_metadata=sources,
+        generated_at="2026-06-07T12:00:00+00:00",
+        report_id="report-123",
+    )
+
+    metadata = json.loads(out_json.read_text(encoding="utf-8"))["metadata"]
+    assert metadata["sources"] == sources
+    assert metadata["timestamp"] == "2026-06-07T12:00:00+00:00"
+    assert metadata["report_id"] == "report-123"
+
+
+def test_structured_exports_share_word_level_result(tmp_path):
+    file_a = tmp_path / "a.docx"
+    file_b = tmp_path / "b.docx"
+    html_report = tmp_path / "report.html"
+    json_report = tmp_path / "report.json"
+    document_a = Document()
+    document_a.add_paragraph("Payment is due in 30 days.")
+    document_a.save(file_a)
+    document_b = Document()
+    document_b.add_paragraph("Payment is due in 45 calendar days.")
+    document_b.save(file_b)
+    result = compare_documents(file_a, file_b)
+
+    export_to_html(
+        result.legacy_lines_a(),
+        result.legacy_lines_b(),
+        str(file_a),
+        str(file_b),
+        str(html_report),
+        structured_result=result,
+    )
+    export_to_json(
+        result.legacy_lines_a(),
+        result.legacy_lines_b(),
+        str(file_a),
+        str(file_b),
+        str(json_report),
+        structured_result=result,
+    )
+
+    html_content = html_report.read_text(encoding="utf-8")
+    data = json.loads(json_report.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 2
+    assert "changes" in data
+    structured_change = data["structured_comparison"]["changes"][0]
+    assert structured_change["old_spans"][0]["text"] == "30"
+    assert "word-del" in html_content
+    assert ">30<" in html_content
 
 
 def test_print_side_by_side(capsys):
@@ -224,14 +491,17 @@ def test_print_statistics(capsys):
     assert "Change Breakdown:" in captured.out
 
 
-@patch("docxdiff.load_docx_lines")
-def test_main_cli_success(mock_load, capsys, tmp_path):
-    mock_load.side_effect = [["line 1", "line 2"], ["line 1", "line 2 changed"]]
-
+def test_main_cli_success(capsys, tmp_path):
     file_a = tmp_path / "a.docx"
     file_b = tmp_path / "b.docx"
-    file_a.write_text("a")
-    file_b.write_text("b")
+    document_a = Document()
+    document_a.add_paragraph("line 1")
+    document_a.add_paragraph("line 2")
+    document_a.save(file_a)
+    document_b = Document()
+    document_b.add_paragraph("line 1")
+    document_b.add_paragraph("line 2 changed")
+    document_b.save(file_b)
 
     test_args = ["docxdiff.py", str(file_a), str(file_b)]
     with patch.object(sys, "argv", test_args):
@@ -240,6 +510,29 @@ def test_main_cli_success(mock_load, capsys, tmp_path):
 
     captured = capsys.readouterr()
     assert "line 2" in captured.out
+
+
+def test_main_ignore_options_keep_original_text_but_ignore_difference(capsys, tmp_path):
+    file_a = tmp_path / "a.docx"
+    file_b = tmp_path / "b.docx"
+    document_a = Document()
+    document_a.add_paragraph("Important   TERMS")
+    document_a.save(file_a)
+    document_b = Document()
+    document_b.add_paragraph("important terms")
+    document_b.save(file_b)
+
+    test_args = [
+        "docxdiff.py",
+        str(file_a),
+        str(file_b),
+        "--ignore-case",
+        "--ignore-whitespace",
+    ]
+    with patch.object(sys, "argv", test_args):
+        assert main() == 0
+
+    assert "No differences found." in capsys.readouterr().out
 
 
 @patch("docxdiff.load_docx_lines")
@@ -254,6 +547,91 @@ def test_main_cli_same_files(mock_load, capsys, tmp_path):
 
     captured = capsys.readouterr()
     assert "Error: Both files point to the same location" in captured.err
+
+
+def test_main_policy_violation_writes_redacted_audit_log(capsys, tmp_path):
+    file_a = tmp_path / "sensitive-a.docx"
+    file_b = tmp_path / "sensitive-b.docx"
+    audit_log = tmp_path / "audit.jsonl"
+    document_a = Document()
+    document_a.add_paragraph("original")
+    document_a.save(file_a)
+    document_b = Document()
+    document_b.add_paragraph("replacement")
+    document_b.save(file_b)
+
+    test_args = [
+        "docxdiff.py",
+        str(file_a),
+        str(file_b),
+        "--quiet",
+        "--min-similarity",
+        "90",
+        "--audit-log",
+        str(audit_log),
+        "--audit-redact-paths",
+    ]
+    with patch.object(sys, "argv", test_args):
+        assert main() == 3
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    event = json.loads(audit_log.read_text(encoding="utf-8").strip())
+    assert event["schema_version"] == 1
+    assert event["sources"]["file_a"]["path"] == file_a.name
+    assert event["sources"]["file_b"]["path"] == file_b.name
+    assert len(event["sources"]["file_a"]["sha256"]) == 64
+    assert event["result"]["exit_code"] == 3
+    assert event["result"]["policy_violations"]
+
+
+@patch("docxdiff.load_docx_lines")
+def test_main_rejects_output_overwriting_input(mock_load, capsys, tmp_path):
+    file_a = tmp_path / "a.docx"
+    file_b = tmp_path / "b.docx"
+    file_a.write_bytes(b"a")
+    file_b.write_bytes(b"b")
+
+    test_args = ["docxdiff.py", str(file_a), str(file_b), "--json", str(file_a)]
+    with patch.object(sys, "argv", test_args):
+        assert main() == 2
+
+    mock_load.assert_not_called()
+    assert "overwrite an input file" in capsys.readouterr().err
+
+
+def test_main_end_to_end_enterprise_reports(tmp_path):
+    file_a = tmp_path / "a.docx"
+    file_b = tmp_path / "b.docx"
+    json_report = tmp_path / "report.json"
+    audit_log = tmp_path / "audit.jsonl"
+
+    document_a = Document()
+    document_a.add_paragraph("Approved contract")
+    document_a.save(file_a)
+
+    document_b = Document()
+    document_b.add_paragraph("Revised contract")
+    document_b.save(file_b)
+
+    test_args = [
+        "docxdiff.py",
+        str(file_a),
+        str(file_b),
+        "--quiet",
+        "--json",
+        str(json_report),
+        "--audit-log",
+        str(audit_log),
+    ]
+    with patch.object(sys, "argv", test_args):
+        assert main() == 1
+
+    report = json.loads(json_report.read_text(encoding="utf-8"))
+    event = json.loads(audit_log.read_text(encoding="utf-8").strip())
+    assert report["metadata"]["sources"]["file_a"]["sha256"] == sha256_file(file_a)
+    assert report["metadata"]["report_id"] == event["event_id"]
+    assert event["result"]["differences_found"] is True
 
 
 def test_display_side_by_side_alignment():
@@ -308,6 +686,178 @@ def test_gui_swap_files():
     gui.status_bar.config.assert_called_once_with(text="Swapped File A and File B")
 
 
+def test_gui_create_menu_bar():
+    class FakeMenu:
+        def __init__(self, parent, tearoff=0):
+            self.parent = parent
+            self.tearoff = tearoff
+            self.items = []
+
+        def add_command(self, **kwargs):
+            self.items.append(("command", kwargs))
+
+        def add_separator(self):
+            self.items.append(("separator", {}))
+
+        def add_cascade(self, **kwargs):
+            self.items.append(("cascade", kwargs))
+
+        def add_checkbutton(self, **kwargs):
+            self.items.append(("checkbutton", kwargs))
+
+    gui = MagicMock(spec=DocxDiffGUI)
+    gui.root = MagicMock()
+    gui.ignore_case_var = MagicMock()
+    gui.ignore_whitespace_var = MagicMock()
+    gui.filter_var = MagicMock()
+    gui.show_line_numbers_var = MagicMock()
+    gui.sync_scroll_var = MagicMock()
+    gui.results_text = MagicMock()
+
+    with patch("docxdiff.tk.Menu", side_effect=FakeMenu):
+        DocxDiffGUI.create_menu_bar(gui)
+
+    top_labels = [
+        item[1]["label"] for item in gui.menu_bar.items if item[0] == "cascade"
+    ]
+    assert top_labels == ["File", "Edit", "Compare", "View", "Help"]
+    gui.root.config.assert_called_once_with(menu=gui.menu_bar)
+
+
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        (2400, "wide"),
+        (1400, "medium"),
+        (900, "compact"),
+        (640, "narrow"),
+    ],
+)
+def test_gui_responsive_mode_breakpoints(width, expected):
+    assert DocxDiffGUI.responsive_mode_for_width(width) == expected
+
+
+def test_gui_reset_options():
+    gui = MagicMock(spec=DocxDiffGUI)
+    gui.context_var = MagicMock()
+    gui.ignore_case_var = MagicMock()
+    gui.ignore_whitespace_var = MagicMock()
+    gui.show_line_numbers_var = MagicMock()
+    gui.filter_var = MagicMock()
+    gui.sync_scroll_var = MagicMock()
+    gui.status_bar = MagicMock()
+
+    DocxDiffGUI.reset_options(gui)
+
+    gui.context_var.set.assert_called_once_with(Config.DEFAULT_CONTEXT_LINES)
+    gui.ignore_case_var.set.assert_called_once_with(False)
+    gui.ignore_whitespace_var.set.assert_called_once_with(False)
+    gui.show_line_numbers_var.set.assert_called_once_with(False)
+    gui.filter_var.set.assert_called_once_with(False)
+    gui.sync_scroll_var.set.assert_called_once_with(True)
+    gui.reset_zoom.assert_called_once_with(update_status=False)
+
+
+def test_gui_new_comparison():
+    gui = MagicMock(spec=DocxDiffGUI)
+    gui.file_a_var = MagicMock()
+    gui.file_b_var = MagicMock()
+    gui.file_a_combo = MagicMock()
+    gui.status_bar = MagicMock()
+
+    DocxDiffGUI.new_comparison(gui)
+
+    gui.file_a_var.set.assert_called_once_with("")
+    gui.file_b_var.set.assert_called_once_with("")
+    gui.reset_options.assert_called_once_with()
+    gui.clear_results.assert_called_once_with()
+    gui.file_a_combo.focus_set.assert_called_once_with()
+    gui.status_bar.config.assert_called_once_with(text="Ready for a new comparison")
+
+
+def test_gui_comparison_starts_without_blocking(tmp_path):
+    file_a = tmp_path / "a.docx"
+    file_b = tmp_path / "b.docx"
+    file_a.write_bytes(b"a")
+    file_b.write_bytes(b"b")
+    release = threading.Event()
+    result = compare_blocks(
+        [DocumentBlock("a", "paragraph", "A", {}, normalized_text="A")],
+        [DocumentBlock("b", "paragraph", "B", {}, normalized_text="B")],
+    )
+
+    gui = MagicMock(spec=DocxDiffGUI)
+    gui.file_a_var = MagicMock()
+    gui.file_b_var = MagicMock()
+    gui.file_a_var.get.return_value = str(file_a)
+    gui.file_b_var.get.return_value = str(file_b)
+    gui.ignore_case_var = MagicMock()
+    gui.ignore_whitespace_var = MagicMock()
+    gui.ignore_case_var.get.return_value = False
+    gui.ignore_whitespace_var.get.return_value = False
+    gui.compare_button = MagicMock()
+    gui.cancel_button = MagicMock()
+    gui.status_bar = MagicMock()
+    gui.root = MagicMock()
+    gui._comparison_thread = None
+    gui._comparison_cancel = threading.Event()
+
+    def slow_worker(*args, **kwargs):
+        release.wait(timeout=2)
+        gui.current_comparison_result = result
+
+    gui._comparison_worker = slow_worker
+    started = time.perf_counter()
+    DocxDiffGUI.compare_files(gui)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.2
+    assert gui._comparison_thread.is_alive()
+    release.set()
+    gui._comparison_thread.join(timeout=2)
+
+    gui.compare_button.config.assert_called_with(state=tk.DISABLED)
+    gui.cancel_button.config.assert_called_with(state=tk.NORMAL)
+
+
+def test_gui_cancel_comparison_sets_event():
+    gui = MagicMock(spec=DocxDiffGUI)
+    gui._comparison_thread = MagicMock()
+    gui._comparison_thread.is_alive.return_value = True
+    gui._comparison_cancel = threading.Event()
+    gui.status_bar = MagicMock()
+
+    DocxDiffGUI.cancel_comparison(gui)
+
+    assert gui._comparison_cancel.is_set()
+    gui.status_bar.config.assert_called_once_with(text="Cancelling comparison...")
+
+
+def test_gui_worker_delivers_result_through_queue(tmp_path):
+    file_a = tmp_path / "a.docx"
+    file_b = tmp_path / "b.docx"
+    result = compare_blocks(
+        [DocumentBlock("a", "paragraph", "A", {})],
+        [DocumentBlock("b", "paragraph", "B", {})],
+    )
+    gui = MagicMock(spec=DocxDiffGUI)
+    gui._comparison_cancel = threading.Event()
+    gui._comparison_queue = queue.Queue()
+    gui.root = MagicMock()
+
+    with patch("docxdiff.compare_documents", return_value=result):
+        DocxDiffGUI._comparison_worker(
+            gui,
+            file_a,
+            file_b,
+            {"ignore_case": False, "ignore_whitespace": False},
+        )
+
+    message, payload = gui._comparison_queue.get_nowait()
+    assert message == "complete"
+    assert payload == (file_a, file_b, result)
+    gui.root.after.assert_not_called()
+
+
 def test_gui_add_to_history():
     gui = MagicMock(spec=DocxDiffGUI)
     gui.history = []
@@ -327,11 +877,13 @@ def test_gui_add_to_history():
 
 @patch("docxdiff.messagebox")
 @patch("docxdiff.filedialog.asksaveasfilename")
-@patch("docxdiff.load_docx_lines")
 @patch("docxdiff.export_to_json")
-def test_gui_export_json_success(mock_export, mock_load, mock_ask, mock_msg):
+def test_gui_export_json_success(mock_export, mock_ask, mock_msg):
     gui = MagicMock(spec=DocxDiffGUI)
     gui.current_diff_lines = ["some diff"]
+    old = DocumentBlock("old", "paragraph", "line 1", {"scope": "body"})
+    new = DocumentBlock("new", "paragraph", "line 2", {"scope": "body"})
+    gui.current_comparison_result = compare_blocks([old], [new])
     gui.file_a_var = MagicMock()
     gui.file_b_var = MagicMock()
     gui.file_a_var.get.return_value = "a.docx"
@@ -345,7 +897,6 @@ def test_gui_export_json_success(mock_export, mock_load, mock_ask, mock_msg):
     gui.status_bar = MagicMock()
 
     mock_ask.return_value = "output.json"
-    mock_load.side_effect = [["line 1"], ["line 2"]]
 
     DocxDiffGUI.export_json(gui)
 

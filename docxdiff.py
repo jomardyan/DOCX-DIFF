@@ -11,18 +11,35 @@ License: MIT
 
 import argparse
 import difflib
+import hashlib
+import html
+import io
 import json
 import logging
 import os
+import queue
 import sys
+import tempfile
 import tkinter as tk
-from datetime import datetime
+import threading
+import time
+import uuid
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
+
+from docxdiff_engine import (
+    ComparisonCancelled,
+    ComparisonResult,
+    WordSpan,
+    compare_documents,
+)
+from docxdiff_reports import block_location_label, build_structured_html
 
 # Version information
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "Hayk Jomardyan"
 __license__ = "MIT"
 
@@ -60,9 +77,15 @@ class Config:
     MIN_FONT_SIZE = 6
     MAX_FONT_SIZE = 24
     GUI_WINDOW_SIZE = "1600x900"
+    GUI_MIN_WIDTH = 620
+    GUI_MIN_HEIGHT = 520
+    GUI_WIDE_BREAKPOINT = 2300
+    GUI_COMPACT_BREAKPOINT = 1250
+    GUI_NARROW_BREAKPOINT = 800
     SUPPORTED_EXTENSIONS = (".docx",)
     MAX_FILE_SIZE_MB = 100  # Maximum file size in MB
     ENCODING = "utf-8"
+    AUDIT_SCHEMA_VERSION = 1
 
 
 # ANSI color codes for terminal output
@@ -84,6 +107,148 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("docxdiff")
+
+
+def utc_now_iso() -> str:
+    """Return a timezone-aware UTC timestamp suitable for machine-readable reports."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Calculate a SHA-256 digest without loading the entire file into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_source_metadata(path: Path, redact_path: bool = False) -> dict:
+    """Build immutable source metadata for reports and audit records."""
+    stat = path.stat()
+    return {
+        "path": path.name if redact_path else str(path),
+        "size_bytes": stat.st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def verify_source_metadata(path: Path, metadata: dict) -> None:
+    """Fail if an input changed after its provenance metadata was captured."""
+    stat = path.stat()
+    if stat.st_size != metadata["size_bytes"] or sha256_file(path) != metadata["sha256"]:
+        raise RuntimeError(f"Input file changed during comparison: {path}")
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace a text file to avoid leaving partial reports."""
+    target = path.resolve()
+    parent = target.parent
+    if not parent.exists():
+        raise IOError(f"Output directory does not exist: {parent}")
+    if not parent.is_dir():
+        raise IOError(f"Output parent is not a directory: {parent}")
+
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding=Config.ENCODING,
+            dir=str(parent),
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(str(temp_path), str(target))
+    except OSError as e:
+        if temp_path is not None:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+        raise IOError(f"Failed to write output file {target}: {e}") from e
+
+
+def append_audit_event(path: Path, event: dict) -> None:
+    """Append one durable JSON Lines audit event."""
+    target = path.resolve()
+    if not target.parent.exists():
+        raise IOError(f"Audit log directory does not exist: {target.parent}")
+
+    record = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    try:
+        with target.open("a", encoding=Config.ENCODING, newline="\n") as audit_file:
+            audit_file.write(record + "\n")
+            audit_file.flush()
+            os.fsync(audit_file.fileno())
+    except OSError as e:
+        raise IOError(f"Failed to append audit log {target}: {e}") from e
+
+
+def validate_output_targets(output_paths: List[Path], input_paths: List[Path]) -> Tuple[bool, str]:
+    """Reject output collisions that could overwrite inputs or other reports."""
+    resolved_inputs = {path.resolve() for path in input_paths}
+    seen = set()
+    for output_path in output_paths:
+        resolved = output_path.resolve()
+        if resolved in resolved_inputs:
+            return False, f"Output path would overwrite an input file: {resolved}"
+        if resolved in seen:
+            return False, f"Multiple outputs use the same path: {resolved}"
+        seen.add(resolved)
+    return True, ""
+
+
+def evaluate_policy(
+    stats: dict,
+    min_similarity: Optional[float] = None,
+    max_changes: Optional[int] = None,
+) -> List[str]:
+    """Evaluate CI policy thresholds and return human-readable violations."""
+    violations = []
+    if min_similarity is not None and stats["similarity"] < min_similarity:
+        violations.append(
+            f"similarity {stats['similarity']:.2f}% is below required {min_similarity:.2f}%"
+        )
+
+    total_changes = stats["additions"] + stats["deletions"]
+    if max_changes is not None and total_changes > max_changes:
+        violations.append(f"change count {total_changes} exceeds allowed {max_changes}")
+    return violations
+
+
+def build_audit_event(
+    run_id: str,
+    generated_at: str,
+    source_metadata: dict,
+    options: dict,
+    differences_found: bool,
+    stats: dict,
+    policy_violations: List[str],
+    exit_code: int,
+    duration_ms: float,
+) -> dict:
+    """Build a versioned audit event without document contents."""
+    return {
+        "schema_version": Config.AUDIT_SCHEMA_VERSION,
+        "event_id": run_id,
+        "timestamp": generated_at,
+        "application": {"name": "docxdiff", "version": __version__},
+        "sources": source_metadata,
+        "options": options,
+        "result": {
+            "differences_found": differences_found,
+            "statistics": stats,
+            "policy_violations": policy_violations,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+        },
+    }
 
 
 def validate_file(path: Path) -> Tuple[bool, str]:
@@ -273,6 +438,10 @@ def export_to_html(
     b_name: str,
     output_path: str,
     context_lines: int = 3,
+    source_metadata: Optional[dict] = None,
+    generated_at: Optional[str] = None,
+    report_id: Optional[str] = None,
+    structured_result: Optional[ComparisonResult] = None,
 ) -> bool:
     """Export diff to HTML file with syntax highlighting.
 
@@ -292,35 +461,67 @@ def export_to_html(
     """
     try:
         logger.debug(f"Exporting HTML to: {output_path}")
-        differ = difflib.HtmlDiff(wrapcolumn=80)
+        if structured_result is not None:
+            html_content = build_structured_html(
+                structured_result,
+                a_name,
+                b_name,
+                application_version=__version__,
+                generated_at=generated_at or utc_now_iso(),
+                context_lines=context_lines,
+                source_metadata=source_metadata,
+                report_id=report_id,
+            )
+            atomic_write_text(Path(output_path), html_content)
+            logger.info(f"HTML export successful: {output_path}")
+            return True
 
+        differ = difflib.HtmlDiff(wrapcolumn=80)
         html_content = differ.make_file(
-            a_lines, b_lines, fromdesc=a_name, todesc=b_name, context=True, numlines=context_lines
+            a_lines,
+            b_lines,
+            fromdesc=html.escape(a_name),
+            todesc=html.escape(b_name),
+            context=True,
+            numlines=context_lines,
         )
 
         # Add custom styling and metadata
-        custom_style = f"""
+        custom_style = """
         <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; }}
-            .diff {{ border: 1px solid #ddd; border-radius: 4px; }}
-            .diff_header {{ background-color: #e0e0e0; padding: 10px; font-weight: bold; }}
-            td.diff_header {{ text-align: right; color: #666; }}
-            .diff_next {{ background-color: #c0c0c0; }}
-            .diff_add {{ background-color: #d4edda; }}
-            .diff_chg {{ background-color: #fff3cd; }}
-            .diff_sub {{ background-color: #f8d7da; }}
-            .footer {{ margin-top: 20px; padding: 10px; background: #f5f5f5;
-                      border-radius: 4px; font-size: 0.9em; color: #666; }}
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; }
+            .diff { border: 1px solid #ddd; border-radius: 4px; }
+            .diff_header { background-color: #e0e0e0; padding: 10px; font-weight: bold; }
+            td.diff_header { text-align: right; color: #666; }
+            .diff_next { background-color: #c0c0c0; }
+            .diff_add { background-color: #d4edda; }
+            .diff_chg { background-color: #fff3cd; }
+            .diff_sub { background-color: #f8d7da; }
+            .footer { margin-top: 20px; padding: 10px; background: #f5f5f5;
+                      border-radius: 4px; font-size: 0.9em; color: #666; }
         </style>
-        <div class="footer">
-            Generated by DOCX Diff v{__version__} on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        </div>
         """
 
         html_content = html_content.replace("</head>", f"{custom_style}</head>")
+        generated_at = generated_at or utc_now_iso()
+        footer_parts = [
+            f"Generated by DOCX Diff v{__version__}",
+            f"Timestamp: {html.escape(generated_at)}",
+        ]
+        if report_id:
+            footer_parts.append(f"Report ID: {html.escape(report_id)}")
+        if source_metadata:
+            footer_parts.extend(
+                [
+                    f"Source A SHA-256: {html.escape(source_metadata['file_a']['sha256'])}",
+                    f"Source B SHA-256: {html.escape(source_metadata['file_b']['sha256'])}",
+                ]
+            )
+        footer = '<div class="footer">' + "<br>".join(footer_parts) + "</div>"
+        html_content = html_content.replace("</body>", f"{footer}</body>")
 
         output_file = Path(output_path)
-        output_file.write_text(html_content, encoding=Config.ENCODING)
+        atomic_write_text(output_file, html_content)
         logger.info(f"HTML export successful: {output_path}")
         return True
 
@@ -341,6 +542,10 @@ def export_to_json(
     b_name: str,
     output_path: str,
     context_lines: int = 3,
+    source_metadata: Optional[dict] = None,
+    generated_at: Optional[str] = None,
+    report_id: Optional[str] = None,
+    structured_result: Optional[ComparisonResult] = None,
 ) -> bool:
     """Export diff to JSON format with metadata and statistics.
 
@@ -381,24 +586,39 @@ def export_to_json(
             if change_type:
                 changes.append({"line_number": i + 1, "type": change_type, "content": content})
 
-        stats = calculate_diff_stats(a_lines, b_lines)
+        stats = (
+            structured_result.statistics
+            if structured_result is not None
+            else calculate_diff_stats(a_lines, b_lines)
+        )
 
         output = {
+            "schema_version": 2 if structured_result is not None else 1,
             "metadata": {
                 "version": __version__,
                 "file_a": a_name,
                 "file_b": b_name,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": generated_at or utc_now_iso(),
                 "context_lines": context_lines,
+                "report_id": report_id,
+                "sources": source_metadata,
             },
             "statistics": stats,
             "changes": changes,
         }
+        if structured_result is not None:
+            output["structured_comparison"] = structured_result.to_dict()
+            output["documents"] = {
+                "file_a": {
+                    "blocks": [block.to_dict() for block in structured_result.blocks_a]
+                },
+                "file_b": {
+                    "blocks": [block.to_dict() for block in structured_result.blocks_b]
+                },
+            }
 
         output_file = Path(output_path)
-        output_file.write_text(
-            json.dumps(output, indent=2, ensure_ascii=False), encoding=Config.ENCODING
-        )
+        atomic_write_text(output_file, json.dumps(output, indent=2, ensure_ascii=False))
         logger.info(f"JSON export successful: {output_path}")
         return True
 
@@ -476,8 +696,12 @@ def main():
     """Main entry point for CLI mode.
 
     Returns:
-        int: Exit code (0=no differences, 1=differences found, 2=error)
+        int: Exit code (0=no differences, 1=differences found, 2=error, 3=policy violation)
     """
+    started_at = time.perf_counter()
+    run_id = str(uuid.uuid4())
+    generated_at = utc_now_iso()
+
     parser = argparse.ArgumentParser(
         description=f"DOCX Diff v{__version__} - Compare DOCX files and display differences.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -577,6 +801,30 @@ For more information, visit: https://github.com/yourusername/docx-diff
         help="Write output to file instead of stdout",
     )
 
+    governance_group = parser.add_argument_group("Governance and Automation")
+    governance_group.add_argument(
+        "--min-similarity",
+        type=float,
+        metavar="PERCENT",
+        help="Fail policy checks if similarity is below this percentage (exit code 3)",
+    )
+    governance_group.add_argument(
+        "--max-changes",
+        type=int,
+        metavar="N",
+        help="Fail policy checks if additions plus deletions exceed N (exit code 3)",
+    )
+    governance_group.add_argument(
+        "--audit-log",
+        metavar="FILE",
+        help="Append a structured JSONL audit record for the comparison",
+    )
+    governance_group.add_argument(
+        "--audit-redact-paths",
+        action="store_true",
+        help="Store file names instead of absolute paths in the audit log",
+    )
+
     args = parser.parse_args()
 
     # Enable verbose logging if requested
@@ -594,6 +842,14 @@ For more information, visit: https://github.com/yourusername/docx-diff
         )
         return 2
 
+    if args.min_similarity is not None and not 0 <= args.min_similarity <= 100:
+        print("Error: Minimum similarity must be between 0 and 100", file=sys.stderr)
+        return 2
+
+    if args.max_changes is not None and args.max_changes < 0:
+        print("Error: Maximum changes cannot be negative", file=sys.stderr)
+        return 2
+
     # Validate and load files
     try:
         path_a = Path(args.file_a).resolve()
@@ -607,17 +863,47 @@ For more information, visit: https://github.com/yourusername/docx-diff
         print("Error: Both files point to the same location", file=sys.stderr)
         return 2
 
+    output_paths = [
+        Path(value)
+        for value in (args.html, args.json, args.output, args.audit_log)
+        if value is not None
+    ]
+    outputs_valid, output_error = validate_output_targets(output_paths, [path_a, path_b])
+    if not outputs_valid:
+        print(f"Error: {output_error}", file=sys.stderr)
+        return 2
+
+    source_metadata = None
+    if args.html or args.json or args.audit_log:
+        try:
+            source_metadata = {
+                "file_a": build_source_metadata(path_a, redact_path=args.audit_redact_paths),
+                "file_b": build_source_metadata(path_b, redact_path=args.audit_redact_paths),
+            }
+        except OSError as e:
+            print(f"Error: Failed to fingerprint input files: {e}", file=sys.stderr)
+            return 2
+
     # Load and process files with error handling
     try:
         if args.verbose:
             print(f"Loading {path_a}...", file=sys.stderr)
 
-        a_lines = load_docx_lines(path_a)
-
         if args.verbose:
             print(f"Loading {path_b}...", file=sys.stderr)
 
-        b_lines = load_docx_lines(path_b)
+        comparison_result = compare_documents(
+            path_a,
+            path_b,
+            ignore_case=args.ignore_case,
+            ignore_whitespace=args.ignore_whitespace,
+        )
+        a_lines = comparison_result.legacy_lines_a()
+        b_lines = comparison_result.legacy_lines_b()
+
+        if source_metadata:
+            verify_source_metadata(path_a, source_metadata["file_a"])
+            verify_source_metadata(path_b, source_metadata["file_b"])
 
     except (ValueError, RuntimeError) as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -627,31 +913,57 @@ For more information, visit: https://github.com/yourusername/docx-diff
         logger.exception("Unexpected error in file loading")
         return 2
 
-    # Apply transformations
-    if args.ignore_whitespace:
-        if args.verbose:
-            print("Normalizing whitespace...", file=sys.stderr)
-        a_lines = [" ".join(x.split()) for x in a_lines]
-        b_lines = [" ".join(x.split()) for x in b_lines]
+    stats = comparison_result.statistics
+    differences_found = comparison_result.differences_found
+    policy_violations = evaluate_policy(stats, args.min_similarity, args.max_changes)
+    comparison_exit_code = 3 if policy_violations else (1 if differences_found else 0)
 
-    if args.ignore_case:
-        if args.verbose:
-            print("Converting to lowercase...", file=sys.stderr)
-        a_lines = [x.lower() for x in a_lines]
-        b_lines = [x.lower() for x in b_lines]
-
-    # Calculate statistics if needed
-    stats = None
-    if args.stats or args.verbose or args.json:
-        stats = calculate_diff_stats(a_lines, b_lines)
+    def write_audit_record() -> bool:
+        if not args.audit_log:
+            return True
+        audit_event = build_audit_event(
+            run_id=run_id,
+            generated_at=generated_at,
+            source_metadata=source_metadata,
+            options={
+                "context_lines": args.context,
+                "ignore_case": args.ignore_case,
+                "ignore_whitespace": args.ignore_whitespace,
+                "min_similarity": args.min_similarity,
+                "max_changes": args.max_changes,
+            },
+            differences_found=differences_found,
+            stats=stats,
+            policy_violations=policy_violations,
+            exit_code=comparison_exit_code,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+        )
+        try:
+            append_audit_event(Path(args.audit_log), audit_event)
+            return True
+        except IOError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return False
 
     # Export to HTML if requested
     if args.html:
         try:
             if args.verbose:
                 print(f"Exporting to HTML: {args.html}...", file=sys.stderr)
-            export_to_html(a_lines, b_lines, str(path_a), str(path_b), args.html, args.context)
-            print(f"HTML export saved to: {args.html}")
+            export_to_html(
+                a_lines,
+                b_lines,
+                str(path_a),
+                str(path_b),
+                args.html,
+                args.context,
+                source_metadata=source_metadata,
+                generated_at=generated_at,
+                report_id=run_id,
+                structured_result=comparison_result,
+            )
+            if not args.quiet:
+                print(f"HTML export saved to: {args.html}")
         except (IOError, RuntimeError) as e:
             print(f"Error: {e}", file=sys.stderr)
             return 2
@@ -661,73 +973,88 @@ For more information, visit: https://github.com/yourusername/docx-diff
         try:
             if args.verbose:
                 print(f"Exporting to JSON: {args.json}...", file=sys.stderr)
-            export_to_json(a_lines, b_lines, str(path_a), str(path_b), args.json, args.context)
-            print(f"JSON export saved to: {args.json}")
+            export_to_json(
+                a_lines,
+                b_lines,
+                str(path_a),
+                str(path_b),
+                args.json,
+                args.context,
+                source_metadata=source_metadata,
+                generated_at=generated_at,
+                report_id=run_id,
+                structured_result=comparison_result,
+            )
+            if not args.quiet:
+                print(f"JSON export saved to: {args.json}")
         except (IOError, RuntimeError) as e:
             print(f"Error: {e}", file=sys.stderr)
             return 2
 
     # If only exporting, we might skip normal output
     if args.quiet:
-        # Just return exit code based on differences
-        matcher = difflib.SequenceMatcher(None, a_lines, b_lines)
-        return 0 if matcher.ratio() == 1.0 else 1
-
-    # Redirect output if needed
-    original_stdout = sys.stdout
-    output_file = None
-    if args.output:
-        try:
-            output_file = open(args.output, "w", encoding=Config.ENCODING)
-            sys.stdout = output_file
-        except IOError as e:
-            print(f"Error: Cannot write to output file: {e}", file=sys.stderr)
+        if not write_audit_record():
             return 2
+        return comparison_exit_code
+
+    output_buffer = io.StringIO() if args.output else None
 
     try:
-        # Display diff based on options
-        any_diff = False
+        def render_output() -> bool:
+            if not differences_found:
+                print("No differences found.")
+                if args.stats:
+                    print_statistics(stats, verbose=args.verbose)
+                return False
 
-        if args.side_by_side:
-            print_side_by_side(a_lines, b_lines, str(path_a), str(path_b))
-            any_diff = True
-        elif args.color:
-            any_diff = print_colored_diff(
-                a_lines,
-                b_lines,
-                a_name=str(path_a),
-                b_name=str(path_b),
-                context_lines=args.context,
-            )
+            if args.side_by_side:
+                print_side_by_side(a_lines, b_lines, str(path_a), str(path_b))
+                rendered_diff = differences_found
+            elif args.color:
+                rendered_diff = print_colored_diff(
+                    a_lines,
+                    b_lines,
+                    a_name=str(path_a),
+                    b_name=str(path_b),
+                    context_lines=args.context,
+                )
+            else:
+                rendered_diff = print_unified_diff(
+                    a_lines,
+                    b_lines,
+                    a_name=str(path_a),
+                    b_name=str(path_b),
+                    context_lines=args.context,
+                )
+
+            if args.stats:
+                print_statistics(stats, verbose=args.verbose)
+            return rendered_diff
+
+        if output_buffer is not None:
+            with redirect_stdout(output_buffer):
+                any_diff = render_output()
         else:
-            any_diff = print_unified_diff(
-                a_lines,
-                b_lines,
-                a_name=str(path_a),
-                b_name=str(path_b),
-                context_lines=args.context,
-            )
+            any_diff = render_output()
 
-        if not any_diff:
-            print("No differences found.")
-
-        # Show statistics if requested
-        if args.stats and stats:
-            print_statistics(stats, verbose=args.verbose)
+        if output_buffer is not None:
+            atomic_write_text(Path(args.output), output_buffer.getvalue())
+            print(f"Output saved to: {args.output}")
 
     except Exception as e:
         print(f"Error during diff generation: {e}", file=sys.stderr)
         logger.exception("Unexpected error during diff generation")
         return 2
-    finally:
-        # Restore stdout
-        if output_file:
-            output_file.close()
-            sys.stdout = original_stdout
-            print(f"Output saved to: {args.output}")
 
-    logger.debug(f"Comparison complete. Differences found: {any_diff}")
-    return 1 if any_diff else 0
+    if policy_violations:
+        for violation in policy_violations:
+            print(f"Policy violation: {violation}", file=sys.stderr)
+
+    if not write_audit_record():
+        return 2
+
+    logger.debug(f"Comparison complete. Differences found: {differences_found}")
+    return comparison_exit_code
 
 
 # pylint: disable=too-many-public-methods
@@ -735,7 +1062,12 @@ class DocxDiffGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("DOCX Comparison Tool - Enhanced")
-        self.root.geometry("1600x900")  # Large window for better diff viewing
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        initial_width = min(1400, max(Config.GUI_MIN_WIDTH, screen_width - 80))
+        initial_height = min(900, max(Config.GUI_MIN_HEIGHT, screen_height - 120))
+        self.root.geometry(f"{initial_width}x{initial_height}")
+        self.root.minsize(Config.GUI_MIN_WIDTH, Config.GUI_MIN_HEIGHT)
 
         # Configure custom style for Compare button
         style = ttk.Style()
@@ -760,6 +1092,10 @@ class DocxDiffGUI:
         # Statistics tracking
         self.stats = {"additions": 0, "deletions": 0, "changes": 0, "similarity": 0.0}
         self.current_diff_lines = []
+        self.current_comparison_result: Optional[ComparisonResult] = None
+        self._comparison_thread: Optional[threading.Thread] = None
+        self._comparison_cancel = threading.Event()
+        self._comparison_queue = queue.Queue()
 
         # File selection frame - compact
         file_frame = ttk.LabelFrame(root, text="Files", padding=3)
@@ -795,93 +1131,149 @@ class DocxDiffGUI:
         # Make entry fields expand
         file_frame.columnconfigure(1, weight=1)
 
-        # Compact options and controls frame - single row
-        control_frame = ttk.Frame(root)
-        control_frame.pack(fill="x", padx=5, pady=(2, 5))
+        # Responsive options and controls area
+        self.control_frame = ttk.Frame(root)
+        self.control_frame.pack(fill="x", padx=5, pady=(2, 5))
 
-        # Left side - Options in a compact frame
-        options_frame = ttk.LabelFrame(control_frame, text="Options", padding=2)
-        options_frame.pack(side="left", padx=2)
+        self.options_frame = ttk.LabelFrame(self.control_frame, text="Options", padding=3)
+        self.stats_frame = ttk.LabelFrame(self.control_frame, text="Stats", padding=3)
+        self.actions_frame = ttk.LabelFrame(self.control_frame, text="Actions", padding=3)
 
-        ttk.Label(options_frame, text="Context:").grid(row=0, column=0, sticky="w", padx=2)
+        self.context_label = ttk.Label(self.options_frame, text="Context:")
         self.context_var = tk.IntVar(value=3)
-        ttk.Spinbox(options_frame, from_=0, to=20, textvariable=self.context_var, width=6).grid(
-            row=0, column=1, padx=2
+        self.context_spinbox = ttk.Spinbox(
+            self.options_frame,
+            from_=0,
+            to=20,
+            textvariable=self.context_var,
+            width=6,
         )
 
         self.ignore_case_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(options_frame, text="Ignore Case", variable=self.ignore_case_var).grid(
-            row=0, column=2, padx=5
+        self.ignore_case_check = ttk.Checkbutton(
+            self.options_frame,
+            text="Ignore Case",
+            variable=self.ignore_case_var,
         )
 
         self.ignore_whitespace_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            options_frame, text="Ignore Space", variable=self.ignore_whitespace_var
-        ).grid(row=0, column=3, padx=5)
+        self.ignore_whitespace_check = ttk.Checkbutton(
+            self.options_frame,
+            text="Ignore Space",
+            variable=self.ignore_whitespace_var,
+        )
 
-        # View options
-        ttk.Label(options_frame, text="Font:").grid(row=0, column=4, sticky="w", padx=(10, 2))
+        self.font_label = ttk.Label(self.options_frame, text="Font:")
         self.font_size_var = tk.IntVar(value=10)
-        ttk.Spinbox(
-            options_frame,
+        self.font_spinbox = ttk.Spinbox(
+            self.options_frame,
             from_=8,
             to=20,
             textvariable=self.font_size_var,
             width=6,
             command=self.update_font_size,
-        ).grid(row=0, column=5, padx=2)
+        )
 
         self.show_line_numbers_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            options_frame,
+        self.line_numbers_check = ttk.Checkbutton(
+            self.options_frame,
             text="Line #",
             variable=self.show_line_numbers_var,
             command=self.toggle_line_numbers,
-        ).grid(row=0, column=6, padx=5)
-
-        # Statistics inline - compact display
-        stats_frame = ttk.LabelFrame(control_frame, text="Stats", padding=2)
-        stats_frame.pack(side="left", padx=2, fill="x", expand=True)
-
-        self.stats_label = ttk.Label(stats_frame, text="No comparison yet", font=("Segoe UI", 9))
-        self.stats_label.pack(padx=5)
-
-        # Compact action buttons on right side
-        button_frame = ttk.LabelFrame(control_frame, text="Actions", padding=2)
-        button_frame.pack(side="right", padx=2)
-
-        ttk.Button(
-            button_frame, text="Compare", command=self.compare_files, width=8, style="Green.TButton"
-        ).pack(side="left", padx=2)
-        ttk.Button(button_frame, text="Clear", command=self.clear_results, width=6).pack(
-            side="left", padx=2
-        )
-        ttk.Button(button_frame, text="Export TXT", command=self.export_txt, width=9).pack(
-            side="left", padx=2
-        )
-        ttk.Button(button_frame, text="Export HTML", command=self.export_html, width=10).pack(
-            side="left", padx=2
-        )
-        ttk.Button(button_frame, text="Export JSON", command=self.export_json, width=11).pack(
-            side="left", padx=2
-        )
-        ttk.Button(button_frame, text="Search", command=self.show_search_dialog, width=7).pack(
-            side="left", padx=2
         )
 
-        ttk.Separator(button_frame, orient=tk.VERTICAL).pack(side="left", fill="y", padx=5)
+        self.stats_label = ttk.Label(
+            self.stats_frame,
+            text="No comparison yet",
+            font=("Segoe UI", 9),
+            anchor=tk.W,
+        )
+        self.stats_label.pack(fill="x", padx=5)
 
-        ttk.Button(button_frame, text="◄", command=self.prev_diff, width=3).pack(
-            side="left", padx=1
+        self.primary_actions = ttk.Frame(self.actions_frame)
+        self.export_actions = ttk.Frame(self.actions_frame)
+        self.navigation_actions = ttk.Frame(self.actions_frame)
+
+        self.compare_button = ttk.Button(
+            self.primary_actions,
+            text="Compare",
+            command=self.compare_files,
+            width=8,
+            style="Green.TButton",
         )
-        ttk.Button(button_frame, text="►", command=self.next_diff, width=3).pack(
-            side="left", padx=1
+        self.compare_button.pack(side="left", padx=2)
+        self.cancel_button = ttk.Button(
+            self.primary_actions,
+            text="Cancel",
+            command=self.cancel_comparison,
+            width=7,
+            state=tk.DISABLED,
         )
+        self.cancel_button.pack(side="left", padx=2)
+        self.clear_button = ttk.Button(
+            self.primary_actions,
+            text="Clear",
+            command=self.clear_results,
+            width=6,
+        )
+        self.clear_button.pack(side="left", padx=2)
+
+        self.export_txt_button = ttk.Button(
+            self.export_actions,
+            text="Export TXT",
+            command=self.export_txt,
+            width=9,
+        )
+        self.export_txt_button.pack(side="left", padx=2)
+        self.export_html_button = ttk.Button(
+            self.export_actions,
+            text="Export HTML",
+            command=self.export_html,
+            width=10,
+        )
+        self.export_html_button.pack(side="left", padx=2)
+        self.export_json_button = ttk.Button(
+            self.export_actions,
+            text="Export JSON",
+            command=self.export_json,
+            width=11,
+        )
+        self.export_json_button.pack(side="left", padx=2)
+
+        self.search_button = ttk.Button(
+            self.navigation_actions,
+            text="Search",
+            command=self.show_search_dialog,
+            width=7,
+        )
+        self.search_button.pack(side="left", padx=2)
+        self.prev_button = ttk.Button(
+            self.navigation_actions,
+            text="◄",
+            command=self.prev_diff,
+            width=3,
+        )
+        self.prev_button.pack(side="left", padx=1)
+        self.next_button = ttk.Button(
+            self.navigation_actions,
+            text="►",
+            command=self.next_diff,
+            width=3,
+        )
+        self.next_button.pack(side="left", padx=1)
 
         self.filter_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(button_frame, text="Changes Only", variable=self.filter_var).pack(
-            side="left", padx=5
+        self.changes_only_check = ttk.Checkbutton(
+            self.navigation_actions,
+            text="Changes Only",
+            variable=self.filter_var,
+            command=self.refresh_structured_view,
         )
+        self.changes_only_check.pack(side="left", padx=5)
+
+        self._responsive_mode = None
+        self._layout_after_id = None
+        self.apply_responsive_layout(initial_width)
 
         # Results frame with tabs - maximized for diff viewing
         results_frame = ttk.Frame(root)
@@ -1075,6 +1467,18 @@ class DocxDiffGUI:
         self.results_text.tag_config(
             "search_highlight", background="#fff8c5", foreground="#24292f"  # Soft yellow
         )
+        self.results_text.tag_config(
+            "word_added", background="#46d160", foreground="#24292f"
+        )
+        self.results_text.tag_config(
+            "word_removed",
+            background="#ff8182",
+            foreground="#24292f",
+            overstrike=True,
+        )
+        self.results_text.tag_config(
+            "moved", background="#ddf4ff", foreground="#0969da"
+        )
 
         # Side-by-side styling
         self.left_text.configure(font=("Consolas", 10), bg="#ffffff", padx=10, pady=5)
@@ -1082,20 +1486,35 @@ class DocxDiffGUI:
 
         self.left_text.tag_config("removed", background="#ffdce0", foreground="#24292f")
         self.left_text.tag_config("context", foreground="#57606a", background="#ffffff")
+        self.left_text.tag_config(
+            "word_removed",
+            background="#ff8182",
+            foreground="#24292f",
+            overstrike=True,
+        )
         self.right_text.tag_config("added", background="#d1f7d6", foreground="#24292f")
         self.right_text.tag_config("context", foreground="#57606a", background="#ffffff")
+        self.right_text.tag_config(
+            "word_added", background="#46d160", foreground="#24292f"
+        )
+        self.left_text.tag_config("moved", background="#ddf4ff", foreground="#0969da")
+        self.right_text.tag_config("moved", background="#ddf4ff", foreground="#0969da")
 
         # Status bar
         self.status_bar = ttk.Label(root, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Keyboard shortcuts
+        self.root.bind("<Control-n>", lambda e: self.new_comparison())
         self.root.bind("<Control-o>", lambda e: self.browse_file("a"))
         self.root.bind("<Control-Shift-O>", lambda e: self.browse_file("b"))
         self.root.bind("<Control-r>", lambda e: self.compare_files())
         self.root.bind("<Control-f>", lambda e: self.show_search_dialog())
         self.root.bind("<Control-s>", lambda e: self.export_txt())
         self.root.bind("<Control-e>", lambda e: self.export_html())
+        self.root.bind("<Control-Key-1>", lambda e: self.select_view(0))
+        self.root.bind("<Control-Key-2>", lambda e: self.select_view(1))
+        self.root.bind("<Control-q>", lambda e: self.root.destroy())
         self.root.bind("<Control-plus>", lambda e: self.adjust_font(1))
         self.root.bind("<Control-minus>", lambda e: self.adjust_font(-1))
         self.root.bind("<Control-equal>", lambda e: self.adjust_font(1))  # For + without shift
@@ -1105,6 +1524,376 @@ class DocxDiffGUI:
         # Store diff positions for navigation
         self.diff_positions = []
         self.current_diff_index = -1
+
+        # Native application menu
+        self.create_menu_bar()
+        self.root.bind("<Configure>", self.on_root_resize, add="+")
+
+    def on_root_resize(self, event):
+        """Debounce root resize events before recalculating the control layout."""
+        if event.widget is not self.root:
+            return
+        if self._layout_after_id is not None:
+            self.root.after_cancel(self._layout_after_id)
+        self._layout_after_id = self.root.after(
+            75,
+            lambda width=event.width: self.apply_responsive_layout(width),
+        )
+
+    def apply_responsive_layout(self, width=None):
+        """Reflow controls into rows appropriate for the available window width."""
+        if width is None:
+            width = self.root.winfo_width()
+
+        mode = self.responsive_mode_for_width(width)
+
+        self._layout_after_id = None
+        if mode == self._responsive_mode:
+            return
+        self._responsive_mode = mode
+
+        for frame in (self.options_frame, self.stats_frame, self.actions_frame):
+            frame.grid_forget()
+        for frame in (
+            self.primary_actions,
+            self.export_actions,
+            self.navigation_actions,
+        ):
+            frame.grid_forget()
+        for widget in (
+            self.context_label,
+            self.context_spinbox,
+            self.ignore_case_check,
+            self.ignore_whitespace_check,
+            self.font_label,
+            self.font_spinbox,
+            self.line_numbers_check,
+        ):
+            widget.grid_forget()
+
+        for column in range(3):
+            self.control_frame.columnconfigure(column, weight=0)
+            self.actions_frame.columnconfigure(column, weight=0)
+        for column in range(7):
+            self.options_frame.columnconfigure(column, weight=0)
+
+        if mode == "wide":
+            self.control_frame.columnconfigure(1, weight=1)
+            self.options_frame.grid(row=0, column=0, padx=2, sticky="ew")
+            self.stats_frame.grid(row=0, column=1, padx=2, sticky="ew")
+            self.actions_frame.grid(row=0, column=2, padx=2, sticky="ew")
+        elif mode == "medium":
+            self.control_frame.columnconfigure(0, weight=1)
+            self.control_frame.columnconfigure(1, weight=1)
+            self.options_frame.grid(row=0, column=0, padx=2, sticky="ew")
+            self.stats_frame.grid(row=0, column=1, padx=2, sticky="ew")
+            self.actions_frame.grid(
+                row=1,
+                column=0,
+                columnspan=2,
+                padx=2,
+                pady=(3, 0),
+                sticky="ew",
+            )
+        else:
+            self.control_frame.columnconfigure(0, weight=1)
+            self.options_frame.grid(row=0, column=0, padx=2, sticky="ew")
+            self.stats_frame.grid(
+                row=1,
+                column=0,
+                padx=2,
+                pady=(3, 0),
+                sticky="ew",
+            )
+            self.actions_frame.grid(
+                row=2,
+                column=0,
+                padx=2,
+                pady=(3, 0),
+                sticky="ew",
+            )
+
+        self._layout_option_controls(mode)
+        self._layout_action_groups(mode)
+        stats_wrap = max(240, width - 40) if mode in ("compact", "narrow") else 420
+        self.stats_label.configure(wraplength=stats_wrap)
+
+    @staticmethod
+    def responsive_mode_for_width(width):
+        """Map a window width to a stable responsive layout mode."""
+        if width >= Config.GUI_WIDE_BREAKPOINT:
+            return "wide"
+        if width >= Config.GUI_COMPACT_BREAKPOINT:
+            return "medium"
+        if width >= Config.GUI_NARROW_BREAKPOINT:
+            return "compact"
+        return "narrow"
+
+    def _layout_option_controls(self, mode):
+        """Arrange comparison and view options within the Options group."""
+        if mode in ("wide", "medium"):
+            placements = (
+                (self.context_label, 0, 0, (2, 2)),
+                (self.context_spinbox, 0, 1, (2, 6)),
+                (self.ignore_case_check, 0, 2, (4, 4)),
+                (self.ignore_whitespace_check, 0, 3, (4, 8)),
+                (self.font_label, 0, 4, (2, 2)),
+                (self.font_spinbox, 0, 5, (2, 6)),
+                (self.line_numbers_check, 0, 6, (4, 4)),
+            )
+        elif mode == "compact":
+            placements = (
+                (self.context_label, 0, 0, (2, 2)),
+                (self.context_spinbox, 0, 1, (2, 6)),
+                (self.ignore_case_check, 0, 2, (4, 4)),
+                (self.ignore_whitespace_check, 0, 3, (4, 4)),
+                (self.font_label, 1, 0, (2, 2)),
+                (self.font_spinbox, 1, 1, (2, 6)),
+                (self.line_numbers_check, 1, 2, (4, 4)),
+            )
+        else:
+            placements = (
+                (self.context_label, 0, 0, (2, 2)),
+                (self.context_spinbox, 0, 1, (2, 6)),
+                (self.font_label, 0, 2, (8, 2)),
+                (self.font_spinbox, 0, 3, (2, 6)),
+                (self.ignore_case_check, 1, 0, (2, 4)),
+                (self.ignore_whitespace_check, 1, 1, (2, 4)),
+                (self.line_numbers_check, 1, 2, (2, 4)),
+            )
+
+        for widget, row, column, padx in placements:
+            widget.grid(row=row, column=column, padx=padx, pady=2, sticky="w")
+
+    def _layout_action_groups(self, mode):
+        """Arrange primary, export, and navigation actions without clipping."""
+        if mode in ("wide", "medium"):
+            self.actions_frame.columnconfigure(2, weight=1)
+            self.primary_actions.grid(row=0, column=0, sticky="w")
+            self.export_actions.grid(row=0, column=1, padx=(8, 0), sticky="w")
+            self.navigation_actions.grid(row=0, column=2, padx=(8, 0), sticky="e")
+        elif mode == "compact":
+            self.actions_frame.columnconfigure(1, weight=1)
+            self.primary_actions.grid(row=0, column=0, sticky="w")
+            self.export_actions.grid(row=0, column=1, padx=(8, 0), sticky="e")
+            self.navigation_actions.grid(
+                row=1,
+                column=0,
+                columnspan=2,
+                pady=(4, 0),
+                sticky="w",
+            )
+        else:
+            self.actions_frame.columnconfigure(0, weight=1)
+            self.primary_actions.grid(row=0, column=0, sticky="w")
+            self.export_actions.grid(row=1, column=0, pady=(4, 0), sticky="w")
+            self.navigation_actions.grid(row=2, column=0, pady=(4, 0), sticky="w")
+
+    def create_menu_bar(self):
+        """Create the native top menu and connect it to existing GUI actions."""
+        menu_bar = tk.Menu(self.root, tearoff=0)
+
+        file_menu = tk.Menu(menu_bar, tearoff=0)
+        file_menu.add_command(
+            label="New Comparison",
+            command=self.new_comparison,
+            accelerator="Ctrl+N",
+        )
+        file_menu.add_separator()
+        file_menu.add_command(
+            label="Open File A...",
+            command=lambda: self.browse_file("a"),
+            accelerator="Ctrl+O",
+        )
+        file_menu.add_command(
+            label="Open File B...",
+            command=lambda: self.browse_file("b"),
+            accelerator="Ctrl+Shift+O",
+        )
+        file_menu.add_command(label="Swap Files", command=self.swap_files)
+        file_menu.add_separator()
+
+        export_menu = tk.Menu(file_menu, tearoff=0)
+        export_menu.add_command(
+            label="Text Report...",
+            command=self.export_txt,
+            accelerator="Ctrl+S",
+        )
+        export_menu.add_command(
+            label="HTML Report...",
+            command=self.export_html,
+            accelerator="Ctrl+E",
+        )
+        export_menu.add_command(label="JSON Report...", command=self.export_json)
+        file_menu.add_cascade(label="Export", menu=export_menu)
+        file_menu.add_separator()
+        file_menu.add_command(
+            label="Exit",
+            command=self.root.destroy,
+            accelerator="Ctrl+Q",
+        )
+        menu_bar.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menu_bar, tearoff=0)
+        edit_menu.add_command(
+            label="Copy Selection",
+            command=self.copy_selection,
+            accelerator="Ctrl+C",
+        )
+        edit_menu.add_command(label="Copy All Results", command=self.copy_all_diff)
+        edit_menu.add_command(
+            label="Select All Results",
+            command=lambda: self.select_all(self.results_text),
+            accelerator="Ctrl+A",
+        )
+        edit_menu.add_separator()
+        edit_menu.add_command(
+            label="Find...",
+            command=self.show_search_dialog,
+            accelerator="Ctrl+F",
+        )
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Clear Results", command=self.clear_results)
+        menu_bar.add_cascade(label="Edit", menu=edit_menu)
+
+        compare_menu = tk.Menu(menu_bar, tearoff=0)
+        compare_menu.add_command(
+            label="Compare Files",
+            command=self.compare_files,
+            accelerator="Ctrl+R",
+        )
+        compare_menu.add_separator()
+        compare_menu.add_command(
+            label="Previous Difference",
+            command=self.prev_diff,
+            accelerator="Shift+F3",
+        )
+        compare_menu.add_command(
+            label="Next Difference",
+            command=self.next_diff,
+            accelerator="F3",
+        )
+        compare_menu.add_separator()
+        compare_menu.add_checkbutton(
+            label="Ignore Case",
+            variable=self.ignore_case_var,
+        )
+        compare_menu.add_checkbutton(
+            label="Ignore Whitespace",
+            variable=self.ignore_whitespace_var,
+        )
+        compare_menu.add_checkbutton(
+            label="Changes Only",
+            variable=self.filter_var,
+            command=self.refresh_structured_view,
+        )
+        compare_menu.add_separator()
+        compare_menu.add_command(label="Reset Options to Defaults", command=self.reset_options)
+        menu_bar.add_cascade(label="Compare", menu=compare_menu)
+
+        view_menu = tk.Menu(menu_bar, tearoff=0)
+        view_menu.add_command(
+            label="Unified Diff",
+            command=lambda: self.select_view(0),
+            accelerator="Ctrl+1",
+        )
+        view_menu.add_command(
+            label="Side-by-Side",
+            command=lambda: self.select_view(1),
+            accelerator="Ctrl+2",
+        )
+        view_menu.add_separator()
+        view_menu.add_command(
+            label="Zoom In",
+            command=lambda: self.adjust_font(1),
+            accelerator="Ctrl++",
+        )
+        view_menu.add_command(
+            label="Zoom Out",
+            command=lambda: self.adjust_font(-1),
+            accelerator="Ctrl+-",
+        )
+        view_menu.add_command(label="Reset Zoom", command=self.reset_zoom)
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Show Line Numbers",
+            variable=self.show_line_numbers_var,
+            command=self.toggle_line_numbers,
+        )
+        view_menu.add_checkbutton(
+            label="Synchronize Side-by-Side Scrolling",
+            variable=self.sync_scroll_var,
+        )
+        menu_bar.add_cascade(label="View", menu=view_menu)
+
+        help_menu = tk.Menu(menu_bar, tearoff=0)
+        help_menu.add_command(label="Keyboard Shortcuts", command=self.show_shortcuts)
+        help_menu.add_separator()
+        help_menu.add_command(label="About DOCX Diff", command=self.show_about)
+        menu_bar.add_cascade(label="Help", menu=help_menu)
+
+        self.menu_bar = menu_bar
+        self.root.config(menu=menu_bar)
+
+    def new_comparison(self):
+        """Reset the workspace for a new comparison."""
+        self.cancel_comparison()
+        self.file_a_var.set("")
+        self.file_b_var.set("")
+        self.reset_options()
+        self.clear_results()
+        self.file_a_combo.focus_set()
+        self.status_bar.config(text="Ready for a new comparison")
+
+    def reset_options(self):
+        """Restore comparison and view options to application defaults."""
+        self.context_var.set(Config.DEFAULT_CONTEXT_LINES)
+        self.ignore_case_var.set(False)
+        self.ignore_whitespace_var.set(False)
+        self.show_line_numbers_var.set(False)
+        self.filter_var.set(False)
+        self.sync_scroll_var.set(True)
+        self.reset_zoom(update_status=False)
+        self.status_bar.config(text="Options reset to defaults")
+
+    def reset_zoom(self, update_status=True):
+        """Restore the default results font size."""
+        self.font_size_var.set(Config.DEFAULT_FONT_SIZE)
+        self.update_font_size()
+        if update_status:
+            self.status_bar.config(text=f"Font size reset to {Config.DEFAULT_FONT_SIZE}pt")
+
+    def select_view(self, index):
+        """Select a comparison result tab by index."""
+        self.notebook.select(index)
+
+    def show_shortcuts(self):
+        """Display the keyboard shortcut reference."""
+        shortcuts = (
+            "Ctrl+N       New comparison\n"
+            "Ctrl+O       Open File A\n"
+            "Ctrl+Shift+O Open File B\n"
+            "Ctrl+R       Compare files\n"
+            "Ctrl+F       Find in results\n"
+            "Ctrl+S       Export text report\n"
+            "Ctrl+E       Export HTML report\n"
+            "Ctrl+1       Unified diff view\n"
+            "Ctrl+2       Side-by-side view\n"
+            "F3           Next difference\n"
+            "Shift+F3     Previous difference\n"
+            "Ctrl++/-     Adjust font size\n"
+            "Ctrl+Q       Exit"
+        )
+        messagebox.showinfo("Keyboard Shortcuts", shortcuts)
+
+    def show_about(self):
+        """Display application version and capability information."""
+        messagebox.showinfo(
+            "About DOCX Diff",
+            f"DOCX Diff v{__version__}\n\n"
+            "Compare Microsoft Word DOCX files using unified and side-by-side views.\n"
+            "Includes text, HTML, and JSON report exports.",
+        )
 
     def browse_file(self, file_type):
         filename = filedialog.askopenfilename(
@@ -1195,12 +1984,22 @@ class DocxDiffGUI:
 
     def toggle_line_numbers(self):
         """Toggle line number display."""
-        # This would require more complex implementation with a separate line number column
-        # For now, just show a message
+        self.refresh_structured_view()
         if self.show_line_numbers_var.get():
-            self.status_bar.config(text="Line numbers enabled (recompare to see effect)")
+            self.status_bar.config(text="Line numbers enabled")
         else:
             self.status_bar.config(text="Line numbers disabled")
+
+    def refresh_structured_view(self):
+        """Re-render the current result after display-only option changes."""
+        result = self.current_comparison_result
+        if result is None:
+            return
+        self.render_structured_comparison(
+            Path(self.file_a_var.get()),
+            Path(self.file_b_var.get()),
+            result,
+        )
 
     def on_scroll(self, event):
         """Synchronize scrolling between side-by-side panes."""
@@ -1252,6 +2051,7 @@ class DocxDiffGUI:
         self.left_text.delete(1.0, tk.END)
         self.right_text.delete(1.0, tk.END)
         self.current_diff_lines = []
+        self.current_comparison_result = None
         self.stats = {"additions": 0, "deletions": 0, "changes": 0, "similarity": 0.0}
         self.stats_label.config(text="No comparison yet")
         self.status_bar.config(text="Ready")
@@ -1259,6 +2059,7 @@ class DocxDiffGUI:
         self.current_diff_index = -1
 
     def compare_files(self):
+        """Validate inputs and start a cancellable background comparison."""
         file_a = self.file_a_var.get()
         file_b = self.file_b_var.get()
 
@@ -1277,164 +2078,274 @@ class DocxDiffGUI:
             messagebox.showerror("Error", "This tool supports DOCX files only.")
             return
 
+        if self._comparison_thread is not None and self._comparison_thread.is_alive():
+            messagebox.showwarning("Comparison Running", "Cancel the current comparison first.")
+            return
+
+        self._comparison_cancel.clear()
+        self.compare_button.config(state=tk.DISABLED)
+        self.cancel_button.config(state=tk.NORMAL)
+        self.status_bar.config(text="Loading and comparing document structure...")
+
+        options = {
+            "ignore_case": self.ignore_case_var.get(),
+            "ignore_whitespace": self.ignore_whitespace_var.get(),
+        }
+        self._comparison_thread = threading.Thread(
+            target=self._comparison_worker,
+            args=(path_a, path_b, options),
+            daemon=True,
+        )
+        self._comparison_thread.start()
+        self.root.after(50, self._poll_comparison_queue)
+
+    def cancel_comparison(self):
+        """Request cancellation of the active comparison."""
+        if self._comparison_thread is not None and self._comparison_thread.is_alive():
+            self._comparison_cancel.set()
+            self.status_bar.config(text="Cancelling comparison...")
+
+    def _comparison_worker(self, path_a: Path, path_b: Path, options: dict):
         try:
-            self.status_bar.config(text="Loading files...")
-            self.root.update_idletasks()
+            result = compare_documents(
+                path_a,
+                path_b,
+                ignore_case=options["ignore_case"],
+                ignore_whitespace=options["ignore_whitespace"],
+                cancel_event=self._comparison_cancel,
+            )
+        except ComparisonCancelled:
+            self._comparison_queue.put(("cancelled", None))
+        except Exception as error:
+            self._comparison_queue.put(("failed", error))
+        else:
+            self._comparison_queue.put(("complete", (path_a, path_b, result)))
 
-            # Load and process files
-            a_lines = load_docx_lines(path_a)
-            b_lines = load_docx_lines(path_b)
+    def _poll_comparison_queue(self):
+        """Deliver worker results on Tk's main thread."""
+        try:
+            message, payload = self._comparison_queue.get_nowait()
+        except queue.Empty:
+            if self._comparison_thread is not None and self._comparison_thread.is_alive():
+                self.root.after(50, self._poll_comparison_queue)
+            return
 
-            self.add_to_history(str(path_a))
-            self.add_to_history(str(path_b))
+        if message == "complete":
+            path_a, path_b, result = payload
+            self._comparison_complete(path_a, path_b, result)
+        elif message == "failed":
+            self._comparison_failed(payload)
+        else:
+            self._comparison_cancelled()
 
-            self.status_bar.config(text="Processing comparison...")
-            self.root.update_idletasks()
+    def _finish_comparison_state(self):
+        self.compare_button.config(state=tk.NORMAL)
+        self.cancel_button.config(state=tk.DISABLED)
+        self._comparison_thread = None
 
-            if self.ignore_whitespace_var.get():
-                a_lines = [" ".join(x.split()) for x in a_lines]
-                b_lines = [" ".join(x.split()) for x in b_lines]
+    def _comparison_cancelled(self):
+        self._finish_comparison_state()
+        self.status_bar.config(text="Comparison cancelled")
 
-            if self.ignore_case_var.get():
-                a_lines = [x.lower() for x in a_lines]
-                b_lines = [x.lower() for x in b_lines]
+    def _comparison_failed(self, error: Exception):
+        self._finish_comparison_state()
+        self.status_bar.config(text="Error occurred")
+        messagebox.showerror("Error", f"An error occurred:\n{str(error)}")
 
-            # Calculate similarity ratio
-            sequence_matcher = difflib.SequenceMatcher(None, a_lines, b_lines)
-            similarity_ratio = sequence_matcher.ratio() * 100
+    def _comparison_complete(
+        self,
+        path_a: Path,
+        path_b: Path,
+        result: ComparisonResult,
+    ):
+        self._finish_comparison_state()
+        self.current_comparison_result = result
+        self.add_to_history(str(path_a))
+        self.add_to_history(str(path_b))
 
-            # Generate diff
-            diff = list(
-                difflib.unified_diff(
-                    a_lines,
-                    b_lines,
-                    fromfile=str(path_a),
-                    tofile=str(path_b),
-                    lineterm="",
-                    n=self.context_var.get(),
+        a_lines = result.legacy_lines_a()
+        b_lines = result.legacy_lines_b()
+        self.current_diff_lines = list(
+            difflib.unified_diff(
+                a_lines,
+                b_lines,
+                fromfile=str(path_a),
+                tofile=str(path_b),
+                lineterm="",
+                n=self.context_var.get(),
+            )
+        )
+        self.stats = {
+            "additions": result.statistics["additions"],
+            "deletions": result.statistics["deletions"],
+            "changes": result.statistics["replacements"],
+            "moved": result.statistics["moved"],
+            "similarity": result.statistics["similarity"],
+        }
+        self.stats_label.config(
+            text=(
+                f"Similarity: {result.statistics['similarity']:.2f}% | "
+                f"Additions: {result.statistics['additions']} | "
+                f"Deletions: {result.statistics['deletions']} | "
+                f"Replaced: {result.statistics['replacements']} | "
+                f"Moved: {result.statistics['moved']}"
+            )
+        )
+        self.render_structured_comparison(path_a, path_b, result)
+        changed = sum(change.change_type != "unchanged" for change in result.changes)
+        self.status_bar.config(text=f"Comparison complete: {changed} structured changes")
+        if not result.differences_found:
+            messagebox.showinfo("Result", "No differences found between the files.")
+
+    def _insert_text_with_spans(
+        self,
+        widget,
+        prefix: str,
+        text: str,
+        base_tag: str,
+        span_tag: str,
+        spans: List[WordSpan],
+    ):
+        widget.insert(tk.END, prefix, base_tag)
+        cursor = 0
+        for span in sorted(spans, key=lambda item: item.start):
+            widget.insert(tk.END, text[cursor : span.start], base_tag)
+            widget.insert(tk.END, text[span.start : span.end], (base_tag, span_tag))
+            cursor = span.end
+        widget.insert(tk.END, text[cursor:] + "\n", base_tag)
+
+    def render_structured_comparison(
+        self,
+        path_a: Path,
+        path_b: Path,
+        result: ComparisonResult,
+    ):
+        """Render one structured result in both GUI views."""
+        self.results_text.delete(1.0, tk.END)
+        self.add_diff_header(
+            path_a,
+            path_b,
+            result.statistics["additions"],
+            result.statistics["deletions"],
+        )
+        self.diff_positions = []
+        show_only_changes = self.filter_var.get()
+        display_number = 1
+        for change in result.changes:
+            if show_only_changes and change.change_type == "unchanged":
+                continue
+            if change.change_type == "moved":
+                location = (
+                    f"{block_location_label(change.old_block)} -> "
+                    f"{block_location_label(change.new_block)}"
                 )
-            )
-
-            # Store diff for export
-            self.current_diff_lines = diff
-
-            # Calculate statistics
-            additions = sum(
-                1 for line in diff if line.startswith("+") and not line.startswith("+++")
-            )
-            deletions = sum(
-                1 for line in diff if line.startswith("-") and not line.startswith("---")
-            )
-            changes = len([op for op in sequence_matcher.get_opcodes() if op[0] == "replace"])
-
-            self.stats = {
-                "additions": additions,
-                "deletions": deletions,
-                "changes": changes,
-                "similarity": similarity_ratio,
-            }
-
-            # Update statistics display
-            stats_text = (
-                f"Similarity: {similarity_ratio:.2f}% | "
-                f"Additions: {additions} | "
-                f"Deletions: {deletions} | "
-                f"Changes: {changes}"
-            )
-            self.stats_label.config(text=stats_text)
-
-            # Display results in unified view with GitHub-style formatting
-            self.results_text.delete(1.0, tk.END)
-
-            # Add GitHub-style header
-            self.add_diff_header(path_a, path_b, additions, deletions)
-
-            # Track diff positions for navigation
-            self.diff_positions = []
-            line_num = 1
-            any_output = False
-
-            # Apply filter if enabled
-            display_lines = []
-            if self.filter_var.get():
-                # Show only changes (no context lines)
-                for line in diff:
-                    if (
-                        line.startswith("+")
-                        or line.startswith("-")
-                        or line.startswith("@")
-                        or line.startswith("---")
-                        or line.startswith("+++")
-                    ):
-                        display_lines.append(line)
             else:
-                display_lines = diff
+                location = block_location_label(change.new_block or change.old_block)
+            if change.change_type != "unchanged":
+                self.diff_positions.append(self.results_text.index(tk.END))
+                self.results_text.insert(
+                    tk.END,
+                    f"@@ {change.change_type.upper()} | {location} @@\n",
+                    "chunk",
+                )
 
-            for line in display_lines:
-                any_output = True
-                # File paths (--- and +++)
-                if line.startswith("---") or line.startswith("+++"):
-                    self.results_text.insert(tk.END, line + "\n", "filepath")
-                # Chunk headers (@@ ... @@)
-                elif line.startswith("@@"):
-                    # Add extra visual separation before chunk
-                    self.results_text.insert(tk.END, "\n", "context")
-                    pos = f"{line_num}.0"
-                    self.results_text.insert(tk.END, line + "\n", "chunk")
-                    self.diff_positions.append(pos)  # Track chunk position
-                    line_num += 2
-                # Added lines - with visual indicator
-                elif line.startswith("+") and not line.startswith("+++"):
-                    # Add visual indicator
-                    if self.show_line_numbers_var.get():
-                        display_line = f"  + {line_num:4d} │ " + line[1:] + "\n"
-                    else:
-                        display_line = "  +" + line[1:] + "\n"
-                    pos = f"{line_num}.0"
-                    self.results_text.insert(tk.END, display_line, "added")
-                    self.diff_positions.append(pos)
-                    line_num += 1
-                # Removed lines - with visual indicator
-                elif line.startswith("-") and not line.startswith("---"):
-                    # Add visual indicator
-                    if self.show_line_numbers_var.get():
-                        display_line = f"  - {line_num:4d} │ " + line[1:] + "\n"
-                    else:
-                        display_line = "  -" + line[1:] + "\n"
-                    pos = f"{line_num}.0"
-                    self.results_text.insert(tk.END, display_line, "removed")
-                    self.diff_positions.append(pos)
-                    line_num += 1
-                # Context lines
+            number = f"{display_number:4d} │ " if self.show_line_numbers_var.get() else ""
+            if change.change_type == "unchanged":
+                block = change.new_block or change.old_block
+                self.results_text.insert(tk.END, f"   {number}{block.text}\n", "context")
+            elif change.change_type == "deleted":
+                self._insert_text_with_spans(
+                    self.results_text,
+                    f" - {number}",
+                    change.old_block.text,
+                    "removed",
+                    "word_removed",
+                    change.old_spans,
+                )
+            elif change.change_type == "added":
+                self._insert_text_with_spans(
+                    self.results_text,
+                    f" + {number}",
+                    change.new_block.text,
+                    "added",
+                    "word_added",
+                    change.new_spans,
+                )
+            elif change.change_type == "moved":
+                self.results_text.insert(
+                    tk.END,
+                    f" ~ {number}{change.new_block.text}\n",
+                    "moved",
+                )
+            else:
+                self._insert_text_with_spans(
+                    self.results_text,
+                    f" - {number}",
+                    change.old_block.text,
+                    "removed",
+                    "word_removed",
+                    change.old_spans,
+                )
+                self._insert_text_with_spans(
+                    self.results_text,
+                    f" + {number}",
+                    change.new_block.text,
+                    "added",
+                    "word_added",
+                    change.new_spans,
+                )
+            display_number += 1
+
+        if not result.differences_found:
+            self.results_text.insert(tk.END, "No differences found.\n", "context")
+        self.current_diff_index = -1
+        self.display_structured_side_by_side(result)
+
+    def display_structured_side_by_side(self, result: ComparisonResult):
+        """Render aligned structured blocks with word-level highlights."""
+        self.left_text.delete(1.0, tk.END)
+        self.right_text.delete(1.0, tk.END)
+        left_number = 1
+        right_number = 1
+        show_numbers = self.show_line_numbers_var.get()
+        for change in result.changes:
+            old_text = change.old_block.text if change.old_block else ""
+            new_text = change.new_block.text if change.new_block else ""
+            left_prefix = f"{left_number:4d} │ " if show_numbers and old_text else ""
+            right_prefix = f"{right_number:4d} │ " if show_numbers and new_text else ""
+            if change.change_type == "unchanged":
+                self.left_text.insert(tk.END, left_prefix + old_text + "\n", "context")
+                self.right_text.insert(tk.END, right_prefix + new_text + "\n", "context")
+            elif change.change_type == "moved":
+                self.left_text.insert(tk.END, left_prefix + old_text + "\n", "moved")
+                self.right_text.insert(tk.END, right_prefix + new_text + "\n", "moved")
+            else:
+                if old_text:
+                    self._insert_text_with_spans(
+                        self.left_text,
+                        left_prefix,
+                        old_text,
+                        "removed",
+                        "word_removed",
+                        change.old_spans,
+                    )
                 else:
-                    # Add spacing for context to align with changed lines
-                    if self.show_line_numbers_var.get():
-                        display_line = (
-                            f"    {line_num:4d} │ " + line + "\n" if line else line + "\n"
-                        )
-                    else:
-                        display_line = "   " + line + "\n" if line else line + "\n"
-                    self.results_text.insert(tk.END, display_line, "context")
-                    line_num += 1
-
-            if not any_output:
-                self.results_text.insert(tk.END, "No differences found.\n", "context")
-                messagebox.showinfo("Result", "No differences found between the files.")
-            else:
-                # Add separator at the end
-                self.results_text.insert(tk.END, "\n" + "―" * 80 + "\n", "header")
-                end_text = f"End of comparison - {len(self.diff_positions)} differences found\n"
-                self.results_text.insert(tk.END, end_text, "header")
-                self.current_diff_index = -1
-
-            # Display side-by-side view
-            self.display_side_by_side(a_lines, b_lines, sequence_matcher)
-
-            self.status_bar.config(text=f"Comparison complete: {len(diff)} difference lines")
-
-        except Exception as e:
-            self.status_bar.config(text="Error occurred")
-            messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+                    self.left_text.insert(tk.END, "\n", "context")
+                if new_text:
+                    self._insert_text_with_spans(
+                        self.right_text,
+                        right_prefix,
+                        new_text,
+                        "added",
+                        "word_added",
+                        change.new_spans,
+                    )
+                else:
+                    self.right_text.insert(tk.END, "\n", "context")
+            if old_text:
+                left_number += 1
+            if new_text:
+                right_number += 1
 
     def add_diff_header(self, path_a, path_b, additions, deletions):
         """Add a GitHub-style header to the diff view."""
@@ -1566,7 +2477,7 @@ class DocxDiffGUI:
 
     def export_txt(self):
         """Export comparison results to a text file."""
-        if not self.current_diff_lines:
+        if self.current_comparison_result is None:
             messagebox.showwarning("Warning", "No comparison results to export.")
             return
 
@@ -1586,7 +2497,10 @@ class DocxDiffGUI:
                     f.write(f"Deletions: {self.stats['deletions']}\n")
                     f.write(f"Changes: {self.stats['changes']}\n")
                     f.write("=" * 70 + "\n\n")
-                    f.write("\n".join(self.current_diff_lines))
+                    if self.current_diff_lines:
+                        f.write("\n".join(self.current_diff_lines))
+                    else:
+                        f.write("No differences found.\n")
 
                 messagebox.showinfo("Success", f"Results exported to {filename}")
                 self.status_bar.config(text=f"Exported to {Path(filename).name}")
@@ -1595,7 +2509,7 @@ class DocxDiffGUI:
 
     def export_html(self):
         """Export comparison results to an HTML file."""
-        if not self.current_diff_lines:
+        if self.current_comparison_result is None:
             messagebox.showwarning("Warning", "No comparison results to export.")
             return
 
@@ -1607,52 +2521,16 @@ class DocxDiffGUI:
 
         if filename:
             try:
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write("<!DOCTYPE html>\n<html>\n<head>\n")
-                    f.write("<meta charset='utf-8'>\n")
-                    f.write("<title>DOCX Comparison Report</title>\n")
-                    f.write("<style>\n")
-                    f.write("body { font-family: 'Courier New', monospace; margin: 20px; }\n")
-                    f.write(".header { color: blue; font-weight: bold; }\n")
-                    f.write(".added { background-color: #e6ffe6; color: green; }\n")
-                    f.write(".removed { background-color: #ffe6e6; color: red; }\n")
-                    f.write(
-                        ".stats { background-color: #f0f0f0; padding: 10px; "
-                        "margin-bottom: 20px; border-radius: 5px; }\n"
-                    )
-                    f.write("pre { white-space: pre-wrap; }\n")
-                    f.write("</style>\n</head>\n<body>\n")
-                    f.write("<h1>DOCX Comparison Report</h1>\n")
-                    f.write("<div class='stats'>\n")
-                    f.write(
-                        f"<p><strong>Generated:</strong> "
-                        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>\n"
-                    )
-                    f.write(
-                        f"<p><strong>Similarity:</strong> {self.stats['similarity']:.2f}%</p>\n"
-                    )
-                    f.write(f"<p><strong>Additions:</strong> {self.stats['additions']} | ")
-                    f.write(f"<strong>Deletions:</strong> {self.stats['deletions']} | ")
-                    f.write(f"<strong>Changes:</strong> {self.stats['changes']}</p>\n")
-                    f.write("</div>\n")
-                    f.write("<pre>\n")
-
-                    for line in self.current_diff_lines:
-                        line = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                        if (
-                            line.startswith("+++")
-                            or line.startswith("---")
-                            or line.startswith("@@")
-                        ):
-                            f.write(f"<span class='header'>{line}</span>\n")
-                        elif line.startswith("+"):
-                            f.write(f"<span class='added'>{line}</span>\n")
-                        elif line.startswith("-"):
-                            f.write(f"<span class='removed'>{line}</span>\n")
-                        else:
-                            f.write(f"{line}\n")
-
-                    f.write("</pre>\n</body>\n</html>")
+                result = self.current_comparison_result
+                export_to_html(
+                    result.legacy_lines_a(),
+                    result.legacy_lines_b(),
+                    self.file_a_var.get(),
+                    self.file_b_var.get(),
+                    filename,
+                    self.context_var.get(),
+                    structured_result=result,
+                )
 
                 messagebox.showinfo("Success", f"Results exported to {filename}")
                 self.status_bar.config(text=f"Exported to {Path(filename).name}")
@@ -1661,7 +2539,7 @@ class DocxDiffGUI:
 
     def export_json(self):
         """Export comparison results to a JSON file."""
-        if not self.current_diff_lines:
+        if self.current_comparison_result is None:
             messagebox.showwarning("Warning", "No comparison results to export.")
             return
 
@@ -1680,25 +2558,15 @@ class DocxDiffGUI:
 
         if filename:
             try:
-                # Load lines to call export_to_json function
-                a_lines = load_docx_lines(Path(file_a))
-                b_lines = load_docx_lines(Path(file_b))
-
-                if self.ignore_whitespace_var.get():
-                    a_lines = [" ".join(x.split()) for x in a_lines]
-                    b_lines = [" ".join(x.split()) for x in b_lines]
-
-                if self.ignore_case_var.get():
-                    a_lines = [x.lower() for x in a_lines]
-                    b_lines = [x.lower() for x in b_lines]
-
+                result = self.current_comparison_result
                 export_to_json(
-                    a_lines,
-                    b_lines,
+                    result.legacy_lines_a(),
+                    result.legacy_lines_b(),
                     file_a,
                     file_b,
                     filename,
                     self.context_var.get(),
+                    structured_result=result,
                 )
 
                 messagebox.showinfo("Success", f"Results exported to {filename}")

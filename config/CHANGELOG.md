@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-06-07
+
+### Added
+- Structured DOCX extraction preserving paragraphs, nested tables, headers, and footers
+- Typed blocks for headings, lists, table cells, headers, and footers
+- Word-level spans for replacements, additions, and deletions
+- Exact block move detection
+- JSON schema v2 with structural locations and word spans
+- Inline word highlighting in GUI unified, side-by-side, and HTML reports
+- Background GUI comparisons with cancellation
+- Dedicated comparison engine and structured reporting modules
+- Responsive GUI control groups with wide, medium, compact, and narrow layouts
+
+### Compatibility
+- Existing CLI flags and exit codes remain unchanged
+- JSON reports retain the legacy `changes` array
+- Legacy terminal unified and side-by-side formats remain available
+
+## [1.1.0] - 2026-06-07
+
+### Added
+- SHA-256 source fingerprints and report IDs in HTML and JSON exports
+- Versioned JSONL audit records with optional path redaction
+- CI policy gates for minimum similarity and maximum change count
+- Exit code `3` for policy violations
+- Output collision checks that protect input documents
+- Native GUI menus for file, edit, comparison, view, export, and help actions
+- GUI commands for new comparisons, default option reset, tab switching, and shortcut help
+
+### Changed
+- HTML, JSON, and redirected text output now use atomic file replacement
+- HTML report descriptions are escaped before rendering
+- Machine-readable timestamps are timezone-aware UTC values
+
 ## [1.0.0] - 2026-02-17
 
 ### Added - Production Release
@@ -109,3 +143,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [1.0.0]: https://github.com/yourusername/docx-diff/releases/tag/v1.0.0
 [0.1.0]: https://github.com/yourusername/docx-diff/releases/tag/v0.1.0
+[1.1.0]: https://github.com/yourusername/docx-diff/releases/tag/v1.1.0
+[2.0.0]: https://github.com/yourusername/docx-diff/releases/tag/v2.0.0

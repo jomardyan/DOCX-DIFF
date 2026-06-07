@@ -24,7 +24,10 @@ A Python tool to compare two DOCX files and display text differences with multip
 
 ### 🎯 Core Features
 - **Dual Mode Operation**: CLI for automation, GUI for interactive use
-- **Text Extraction**: Extracts text from paragraphs and table cells in DOCX files
+- **Structured Extraction**: Preserves paragraph, nested-table, header, and footer order
+- **Semantic Blocks**: Identifies headings, list items, table cells, headers, and footers
+- **Word-Level Diff**: Highlights the exact words and punctuation changed inside blocks
+- **Move Detection**: Distinguishes relocated blocks from additions and deletions
 - **Multiple Output Formats**: Unified diff, side-by-side, colored terminal output
 - **Smart Comparison**: Case-insensitive and whitespace normalization options
 
@@ -40,18 +43,29 @@ A Python tool to compare two DOCX files and display text differences with multip
 - **Clipboard Support**: Copy entire diff or selections
 
 ### 🎨 Visual Features (GUI)
+- **Native Top Menu**: File, Edit, Compare, View, and Help actions
 - **Tabbed Interface**: Switch between unified and side-by-side views
 - **Color Coding**: Green for additions, red for deletions, white for context
 - **Synchronized Scrolling**: Side-by-side panes scroll together
 - **Adjustable Font**: Zoom in/out for better readability
 - **Line Numbers**: Optional line number display
 - **Search Function**: Find text within diff results
+- **Responsive Comparison**: Large comparisons run in the background and can be cancelled
+- **Responsive Controls**: Options, statistics, exports, and navigation regroup as the window resizes
 
 ### ⚙️ Comparison Options
 - **Context Lines**: Configurable (0-20 lines)
 - **Case-Insensitive**: Optional case matching
 - **Whitespace Normalization**: Ignore spacing differences
 - **Filter Changes**: Show only modified lines
+
+### Enterprise Automation
+- **Integrity Provenance**: HTML and JSON reports include SHA-256 fingerprints
+- **Audit Trail**: Optional JSON Lines audit log with versioned records and run IDs
+- **Policy Gates**: Enforce minimum similarity and maximum change thresholds in CI
+- **Atomic Writes**: Reports and redirected output are replaced atomically
+- **Output Protection**: Refuses output paths that would overwrite source documents
+- **Privacy Control**: Audit logs can redact absolute paths
 
 ### 🖥️ Cross-Platform
 - Works on Windows, macOS, and Linux
@@ -60,7 +74,7 @@ A Python tool to compare two DOCX files and display text differences with multip
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.8+
 - `python-docx` library
 
 ## Installation
@@ -112,7 +126,7 @@ python docxdiff.py file1.docx file2.docx --html report.html
 | **Navigation** | Manual scrolling | ◄/► buttons between changes |
 | **Search** | Pipe to grep/findstr | Built-in search (Ctrl+F) |
 | **Export HTML** | `--html file.html` | Export HTML button |
-| **Export JSON** | `--json file.json` | Not available |
+| **Export JSON** | `--json file.json` | Export JSON button |
 | **Export TXT** | `--output file.txt` | Export TXT button |
 | **Copy to Clipboard** | Terminal selection | Copy All / Copy Selection |
 | **Font Adjustment** | N/A | +/- buttons, Ctrl+±  |
@@ -151,7 +165,7 @@ The GUI provides a user-friendly interface with the following capabilities:
 
 #### **View Modes**
 1. **Unified Diff Tab**
-   - GitHub-style color-coded diff display
+   - GitHub-style block and inline word highlighting
    - Additions in green background
    - Deletions in red background
    - Context lines in white
@@ -163,6 +177,7 @@ The GUI provides a user-friendly interface with the following capabilities:
    - Modified document (File B) on the right with green highlighting
    - Toggle sync scroll on/off
    - Resizable panes
+   - Word-level highlights inside replaced blocks
 
 #### **Statistics Panel**
 - Real-time similarity percentage
@@ -175,6 +190,7 @@ The GUI provides a user-friendly interface with the following capabilities:
 - **► Next Diff**: Jump to next change
 - **Changes Only**: Filter to show only changed lines
 - **Search**: Find text within diff results (Ctrl+F)
+- **Cancel**: Stop an active background comparison
 
 #### **Export Options**
 - **Export TXT**: Save diff as plain text file
@@ -183,6 +199,7 @@ The GUI provides a user-friendly interface with the following capabilities:
 - Copy Selection: Copy selected text
 
 #### **Keyboard Shortcuts**
+- `Ctrl+N`: Start a new comparison
 - `Ctrl+O`: Open File A
 - `Ctrl+Shift+O`: Open File B
 - `Ctrl+R`: Compare files
@@ -192,6 +209,9 @@ The GUI provides a user-friendly interface with the following capabilities:
 - `Ctrl+C`: Copy selection
 - `Ctrl++`: Increase font size
 - `Ctrl+-`: Decrease font size
+- `Ctrl+1`: Open Unified Diff view
+- `Ctrl+2`: Open Side-by-Side view
+- `Ctrl+Q`: Exit
 
 ### GUI Workflow
 
@@ -312,6 +332,18 @@ else
 fi
 ```
 
+**Enforce review policy in CI**:
+```bash
+python docxdiff.py baseline.docx candidate.docx \
+  --quiet --min-similarity 95 --max-changes 20
+```
+
+**Write a redacted audit trail**:
+```bash
+python docxdiff.py baseline.docx candidate.docx \
+  --json report.json --audit-log audit.jsonl --audit-redact-paths
+```
+
 ### Command Line Options Reference
 
 ```
@@ -337,9 +369,26 @@ Export Options:
   --json FILE           Export diff to JSON file
   --output FILE, -o FILE
                         Write output to file instead of stdout
+
+Governance and Automation:
+  --min-similarity PERCENT
+                        Exit with code 3 when similarity is below PERCENT
+  --max-changes N       Exit with code 3 when additions plus deletions exceed N
+  --audit-log FILE      Append a versioned JSONL audit record
+  --audit-redact-paths  Store file names instead of absolute paths in audit data
 ```
 
 ### Output Formats
+
+#### JSON Schema v2
+
+JSON reports retain the legacy `changes` array and add:
+
+- `schema_version: 2`
+- Typed document blocks with structural locations
+- Block changes classified as added, deleted, replaced, moved, or unchanged
+- Character-based word spans for original and modified text
+- Comparison options and structured statistics
 
 #### Unified Diff (Default)
 ```
@@ -371,6 +420,7 @@ Total Lines (B):   45
 - `0`: Files are identical (no differences)
 - `1`: Files differ
 - `2`: Error occurred (file not found, invalid format, etc.)
+- `3`: A configured comparison policy was violated
 
 ## 📖 Additional Resources
 
@@ -502,7 +552,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
   - On Linux: `sudo apt-get install python3-tk`
 - **DPI Issues on Windows**: Automatically handled, but try running as administrator if issues persist
 - **Fonts look wrong**: The GUI uses Consolas for code view - ensure it's installed
-- **Window too small**: The GUI starts at 1600x900 - resize or maximize the window
+- **Window layout**: Controls automatically reflow into additional rows on smaller screens
 
 #### Terminal Issues (CLI)
 - **Colors not showing**: 
@@ -549,7 +599,7 @@ python docxdiff.py large1.docx large2.docx -c 0
 ## Future Enhancements
 
 - Support for comparing PDF and other document formats
-- Word-level diff highlighting
+- Formatting changes such as fonts, emphasis, color, alignment, and styles
 - Configuration file support
 - Batch comparison of multiple document pairs
 - Integration with version control systems
